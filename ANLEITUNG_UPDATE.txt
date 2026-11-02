@@ -1,0 +1,69 @@
+KICKFORGE v2 - UPDATE UND BEDIENUNG
+===================================
+
+UPDATE (ca. 20 Minuten, nur im Browser)
+---------------------------------------
+1. Dieses ZIP entpacken.
+2. Dein GitHub-Repository oeffnen > "Add file" > "Upload files".
+3. Aus dem entpackten Ordner diese ZWEI Dinge ins Browserfenster ziehen:
+     - den Ordner  "Source"
+     - die Datei   "CMakeLists.txt"
+   (Den versteckten Ordner ".github" NICHT hochladen.)
+   GitHub ersetzt die alten Dateien automatisch und fuegt die neuen hinzu.
+4. Unten auf "Commit changes" klicken. Der Build startet von selbst.
+
+5. EMPFOHLEN, EINMALIG: Workflow ersetzen
+     - Im Repo die Datei  .github/workflows/build.yml  oeffnen
+     - Stift-Symbol (Edit) > alles markieren > loeschen
+     - Den Inhalt der Datei  WORKFLOW_build.yml.txt  (liegt im ZIP) einfuegen
+     - "Commit changes"
+   Vorteil: nur noch der Windows-Build (kein roter Mac-Fehler mehr) und bei
+   einem Fehler gibt es ein herunterladbares Fehlerprotokoll ("build-log").
+
+6. Reiter "Actions" > neuester Lauf (oben) > ganz unten bei "Artifacts"
+   "KickForge-Windows" herunterladen > entpacken.
+
+7. Installieren: DAW ZUERST SCHLIESSEN, dann den Ordner/die Datei
+   KickForge.vst3 (aus dem Unterordner VST3) nach
+     C:\Program Files\Common Files\VST3\
+   kopieren und die alte Version ueberschreiben. DAW starten, Plugins neu scannen.
+
+WENN DER BUILD FEHLSCHLAEGT (rotes Kreuz bei Windows)
+-----------------------------------------------------
+Der Code wurde nicht auf einem echten Compiler getestet. Dann:
+  - Artifact "build-log" herunterladen (oder im Lauf auf "build" > Schritt
+    "Build" klicken und den roten Fehlertext kopieren)
+  - Datei oder Text an Claude schicken. Meist ist es nur ein Tippfehler.
+
+WICHTIG
+-------
+- Alte Projekte/Presets aus v1 laden nicht (Parameter wurden umbenannt).
+- Das Plugin enthaelt keine Sounds, du laedst deine eigenen Kick-Samples.
+
+BEDIENUNG IN KURZ
+-----------------
+Oben:   "Main folder" waehlt deinen Sample-Ordner. Hat er Unterordner, bekommt
+        jeder Layer automatisch einen davon (spaeter aenderbar).
+        "Randomise"   = jeder Layer wuerfelt NUR in seinem eigenen Ordner.
+        "Full random" = alle Layer wuerfeln im GANZEN Hauptordner.
+        "Play" spielt den Kick, "Export WAV" speichert ihn (mit allen Effekten),
+        "Drag kick" zieht ihn als WAV in deine DAW.
+Links:  6 Layer. Pro Layer: Sample laden (Klick oder Datei hineinziehen),
+        "Rnd" = nur diesen Layer wuerfeln, M = Mute, S = Solo,
+        Ordner-Auswahl (nur dieser Layer wuerfelt dort),
+        Key = Tonhoehe folgt der MIDI-Note, Inv = Phase drehen,
+        Lock = Layer bleibt beim Wuerfeln unveraendert, Regler = Lautstaerke.
+        Klick auf einen Layer waehlt ihn fuer Shaper und Effekte aus.
+        "Master" unten: Gesamtlautstaerke, Klick = Master-Effekte.
+Mitte oben: Visualizer. Wave = alle Layer ueberlagert (Phase!), Stack = jeder
+        Layer in eigener Spur, Spectrum = Frequenzbild. "Phase match" zeigt pro
+        Layer, wie gut er zum Rest passt (+1 gut, rot = loescht sich aus).
+        Zoom-Regler oben rechts.
+Mitte:  Volume Shaper: mit der Maus eine Lautstaerkekurve ueber den Layer
+        zeichnen (so wird jeder Sound zum Punch, Crunch, Sub ...).
+        Doppelklick = zuruecksetzen, Rechtsklick/Knoepfe = Formen.
+        Rechts: Pitch (Halbtoene), Root note (Note, bei der das Sample original
+        klingt), Offset (Layer um 0-40 ms verzoegern).
+Unten:  Effekt-Rack des gewaehlten Layers (oder Master). Reihenfolge fest:
+        Transient > Shifter > Distortion > Clipper > EQ > Multiband > Reverb.
+        Der Punkt vor dem Namen leuchtet, wenn der Effekt an ist.

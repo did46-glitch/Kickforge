@@ -1,0 +1,33 @@
+name: Build KickForge
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4 2>&1 | tee build.log
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: KickForge-Windows
+          path: build/KickForge_artefacts/Release
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log

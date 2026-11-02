@@ -1,32 +1,38 @@
 #include "PluginEditor.h"
 
 KickForgeAudioProcessorEditor::KickForgeAudioProcessorEditor (KickForgeAudioProcessor& p)
-    : AudioProcessorEditor (&p), proc (p), dragArea (p)
+    : AudioProcessorEditor (&p), proc (p), master (p), viz (p), detail (p), dragArea (p)
 {
-    lnf.setColourScheme (juce::LookAndFeel_V4::getMidnightColourScheme());
     setLookAndFeel (&lnf);
 
     for (int i = 0; i < kNumSlots; ++i)
     {
-        slots.push_back (std::make_unique<SlotComponent> (proc, i));
-        addAndMakeVisible (*slots.back());
+        auto s = std::make_unique<ui::LayerStrip> (proc, i);
+        s->onSelect = [this] (int idx) { selectLayer (idx); };
+        addAndMakeVisible (*s);
+        strips.push_back (std::move (s));
     }
 
+    master.onSelect = [this] { selectMaster(); };
+    addAndMakeVisible (master);
+    addAndMakeVisible (viz);
+    addAndMakeVisible (detail);
     addAndMakeVisible (dragArea);
 
-    for (auto* b : { &folderButton, &randomButton, &playButton, &exportButton })
+    for (auto* b : { &folderBtn, &randBtn, &fullRandBtn, &playBtn, &exportBtn })
         addAndMakeVisible (*b);
 
-    addAndMakeVisible (folderLabel);
-    folderLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+    folderLabel.setColour (juce::Label::textColourId, ui::textLo);
     folderLabel.setJustificationType (juce::Justification::centredLeft);
+    folderLabel.setFont (juce::Font (12.0f, juce::Font::plain));
+    addAndMakeVisible (folderLabel);
     updateFolderLabel();
 
     juce::Component::SafePointer<KickForgeAudioProcessorEditor> safe (this);
 
-    folderButton.onClick = [this, safe]
+    folderBtn.onClick = [this, safe]
     {
-        chooser = std::make_shared<juce::FileChooser> ("Choose your kick sample folder", proc.getSampleFolder());
+        chooser = std::make_shared<juce::FileChooser> ("Choose your main kick sample folder", proc.getMainFolder());
 
         chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
                               [safe, c = chooser] (const juce::FileChooser& fc)
@@ -34,21 +40,28 @@ KickForgeAudioProcessorEditor::KickForgeAudioProcessorEditor (KickForgeAudioProc
                                   const auto f = fc.getResult();
                                   if (safe != nullptr && f.isDirectory())
                                   {
-                                      safe->proc.setSampleFolder (f);
+                                      safe->proc.setMainFolder (f);
                                       safe->updateFolderLabel();
+                                      safe->refreshStrips();
                                   }
                               });
     };
 
-    randomButton.onClick = [this]
+    randBtn.onClick = [this]
     {
-        proc.randomise();
-        refreshAll();
+        proc.randomiseAll (true); // each layer stays inside its own folder
+        refreshStrips();
     };
 
-    playButton.onClick = [this] { proc.triggerPreview(); };
+    fullRandBtn.onClick = [this]
+    {
+        proc.randomiseAll (false); // every layer draws from the whole main folder
+        refreshStrips();
+    };
 
-    exportButton.onClick = [this, safe]
+    playBtn.onClick = [this] { proc.triggerPreview(); };
+
+    exportBtn.onClick = [this, safe]
     {
         chooser = std::make_shared<juce::FileChooser> ("Save kick as WAV",
                                                        juce::File::getSpecialLocation (juce::File::userDesktopDirectory)
@@ -65,85 +78,144 @@ KickForgeAudioProcessorEditor::KickForgeAudioProcessorEditor (KickForgeAudioProc
                               });
     };
 
-    driveSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    driveSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 62, 20);
-    outSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    outSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 62, 20);
-    outSlider.setTextValueSuffix (" dB");
+    selectLayer (0);
 
-    driveLabel.setText ("Drive", juce::dontSendNotification);
-    outLabel.setText ("Output", juce::dontSendNotification);
+    setResizable (true, true);
+    setResizeLimits (1100, 760, 1700, 1100);
+    setSize (1180, 800);
 
-    addAndMakeVisible (driveSlider);
-    addAndMakeVisible (outSlider);
-    addAndMakeVisible (driveLabel);
-    addAndMakeVisible (outLabel);
-    addAndMakeVisible (keyTrackButton);
-
-    driveAtt = std::make_unique<SliderAtt> (proc.apvts, "drive", driveSlider);
-    outAtt   = std::make_unique<SliderAtt> (proc.apvts, "out", outSlider);
-    keyAtt   = std::make_unique<ButtonAtt> (proc.apvts, "keytrack", keyTrackButton);
-
-    setSize (680, 590);
+    proc.renderPreview();
+    startTimerHz (30);
 }
 
 KickForgeAudioProcessorEditor::~KickForgeAudioProcessorEditor()
 {
+    stopTimer();
     setLookAndFeel (nullptr);
+}
+
+void KickForgeAudioProcessorEditor::selectLayer (int i)
+{
+    for (int k = 0; k < (int) strips.size(); ++k)
+        strips[(size_t) k]->setSelected (k == i);
+
+    master.setSelected (false);
+    detail.setLayer (i);
+    setRackScope (i);
+}
+
+void KickForgeAudioProcessorEditor::selectMaster()
+{
+    for (auto& s : strips)
+        s->setSelected (false);
+
+    master.setSelected (true);
+    setRackScope (kNumSlots);
+}
+
+void KickForgeAudioProcessorEditor::setRackScope (int s)
+{
+    rack.reset();
+    rack = std::make_unique<ui::FxRack> (proc, s);
+    addAndMakeVisible (*rack);
+    resized();
+}
+
+void KickForgeAudioProcessorEditor::refreshStrips()
+{
+    for (auto& s : strips)
+        s->refresh();
 }
 
 void KickForgeAudioProcessorEditor::updateFolderLabel()
 {
-    const auto f = proc.getSampleFolder();
+    const auto f = proc.getMainFolder();
     folderLabel.setText (f.isDirectory() ? f.getFullPathName()
-                                         : juce::String ("No folder chosen (tip: one subfolder per layer)"),
+                                         : juce::String ("No folder chosen - pick one, subfolders become the layer folders"),
                          juce::dontSendNotification);
 }
 
-void KickForgeAudioProcessorEditor::refreshAll()
+void KickForgeAudioProcessorEditor::timerCallback()
 {
-    for (auto& s : slots)
-        s->refresh();
+    bool rendered = false;
+
+    if (proc.previewNeedsUpdate())
+    {
+        proc.renderPreview();
+        rendered = true;
+    }
+
+    const float ph = proc.getPlayheadSeconds();
+    if (rendered || ph >= 0.0f || lastPlayhead >= 0.0f)
+        viz.repaint();
+    lastPlayhead = ph;
+
+    detail.tick();
+
+    for (auto& s : strips)
+        s->tick();
+
+    master.tick();
 }
 
 void KickForgeAudioProcessorEditor::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colour (0xff15171c));
+    g.fillAll (ui::bg);
+
+    g.setColour (ui::textHi);
+    g.setFont (juce::Font (23.0f, juce::Font::bold));
+    g.drawText ("KickForge", 20, 12, 170, 28, juce::Justification::centredLeft);
+
+    for (int i = 0; i < kNumSlots; ++i)
+    {
+        g.setColour (ui::layerColour (i));
+        g.fillRoundedRectangle (21.0f + (float) i * 24.0f, 46.0f, 20.0f, 3.0f, 1.5f);
+    }
 }
 
 void KickForgeAudioProcessorEditor::resized()
 {
     auto r = getLocalBounds().reduced (10);
 
-    auto header = r.removeFromTop (70);
-    auto row1 = header.removeFromTop (30);
-    folderButton.setBounds (row1.removeFromLeft (90));
-    row1.removeFromLeft (6);
-    randomButton.setBounds (row1.removeFromLeft (100));
-    row1.removeFromLeft (6);
-    playButton.setBounds (row1.removeFromLeft (70));
-    row1.removeFromLeft (6);
-    exportButton.setBounds (row1.removeFromLeft (100));
-    row1.removeFromLeft (10);
-    folderLabel.setBounds (row1);
+    auto top = r.removeFromTop (54);
+    top.removeFromLeft (180);
 
-    header.removeFromTop (6);
-    dragArea.setBounds (header.removeFromTop (30));
+    dragArea.setBounds (top.removeFromRight (180).reduced (0, 10));
+    top.removeFromRight (8);
+    exportBtn.setBounds (top.removeFromRight (84).reduced (0, 10));
+    top.removeFromRight (6);
+    playBtn.setBounds (top.removeFromRight (56).reduced (0, 10));
+    top.removeFromRight (6);
+    fullRandBtn.setBounds (top.removeFromRight (104).reduced (0, 10));
+    top.removeFromRight (6);
+    randBtn.setBounds (top.removeFromRight (96).reduced (0, 10));
+    top.removeFromRight (10);
+    folderBtn.setBounds (top.removeFromLeft (100).reduced (0, 10));
+    top.removeFromLeft (8);
+    folderLabel.setBounds (top.reduced (0, 10));
 
-    r.removeFromTop (6);
+    r.removeFromTop (8);
 
-    for (auto& s : slots)
-        s->setBounds (r.removeFromTop (64));
+    auto left = r.removeFromLeft (396);
+    r.removeFromLeft (10);
 
-    r.removeFromTop (6);
+    master.setBounds (left.removeFromBottom (62));
+    left.removeFromBottom (6);
 
-    auto d = r.removeFromTop (28);
-    driveLabel.setBounds (d.removeFromLeft (70));
-    driveSlider.setBounds (d);
+    const int gap = 6;
+    const int sh = (left.getHeight() - gap * (kNumSlots - 1)) / kNumSlots;
 
-    auto o = r.removeFromTop (28);
-    outLabel.setBounds (o.removeFromLeft (70));
-    outSlider.setBounds (o);
+    for (auto& s : strips)
+    {
+        s->setBounds (left.removeFromTop (sh));
+        left.removeFromTop (gap);
+    }
 
-    keyTrackButton.setBounds (r.removeFromTop (28));
+    viz.setBounds (r.removeFromTop (232));
+    r.removeFromTop (8);
+    detail.setBounds (r.removeFromTop (192));
+    r.removeFromTop (8);
+
+    if (rack != nullptr)
+        rack->setBounds (r);
 }
