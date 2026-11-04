@@ -12,12 +12,89 @@ inline const juce::Colour panel2 { 0xff1b2130 };
 inline const juce::Colour textHi { 0xffe8ecf4 };
 inline const juce::Colour textLo { 0xff7d879b };
 inline const juce::Colour hot    { 0xff35e0ff };
+inline const juce::Colour ember  { 0xffff7a1a };
+inline const juce::Colour gold   { 0xffffc857 };
 
 inline juce::Colour layerColour (int i)
 {
     static const juce::uint32 c[7] = { 0xffff4d6d, 0xffff9f1c, 0xffffd23f, 0xff3ddc97,
                                        0xff3fa7ff, 0xffb86bff, 0xffe8ecf4 };
     return juce::Colour (c[juce::jlimit (0, 6, i)]);
+}
+
+inline juce::Colour sourceColour (int src)
+{
+    return src < kf::kMods ? juce::Colour::fromHSV ((float) src / 12.0f + 0.02f, 0.6f, 1.0f, 1.0f) : gold.withMultipliedBrightness (0.7f + 0.1f * (float) (src - kf::kMods));
+}
+
+inline juce::String sourceName (int src)
+{
+    return src < kf::kMods ? "Mod " + juce::String (src + 1) : "Macro " + juce::String (src - kf::kMods + 1);
+}
+
+inline juce::String fmtValue (const kf::PInfo& p, float v)
+{
+    using juce::String;
+
+    switch (p.fmt)
+    {
+        case kf::F_HZ:     return v >= 1000.0f ? String (v / 1000.0f, 2) + " kHz" : (v < 100.0f ? String (v, 1) : String (juce::roundToInt (v))) + " Hz";
+        case kf::F_DB:     return String (v, 1) + " dB";
+        case kf::F_PCT:    return String (juce::roundToInt (v * 100.0f)) + " %";
+        case kf::F_MS:     return v >= 1000.0f ? String (v / 1000.0f, 2) + " s" : String (v, v < 10.0f ? 2 : 1) + " ms";
+        case kf::F_RATIO:  return String (v, 1) + " : 1";
+        case kf::F_SEMI:   return (v > 0.005f ? "+" : "") + String (v, 2) + " st";
+        case kf::F_INT:    return String (juce::roundToInt (v));
+        case kf::F_BOOL:   return v > 0.5f ? "On" : "Off";
+        case kf::F_NOTE:
+        {
+            static const char* nn[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+            const int n = juce::jlimit (0, 127, juce::roundToInt (v));
+            return String (nn[n % 12]) + String (n / 12 - 2);
+        }
+        case kf::F_CHOICE:
+        {
+            juce::StringArray c;
+            c.addTokens (p.choices != nullptr ? p.choices : "", "|", "");
+            return c.isEmpty() ? String() : c[juce::jlimit (0, c.size() - 1, juce::roundToInt (v))];
+        }
+        default:           return String (v, 2);
+    }
+}
+
+// Typed input: understands note names (C4, F#2, Bb1), 1.5k, 20 ms, 0.5 s, 50 %, choice names
+inline float parseValue (const kf::PInfo& p, const juce::String& txt, float current)
+{
+    const auto t = txt.trim();
+    if (t.isEmpty()) return current;
+
+    if (p.fmt == kf::F_NOTE && juce::CharacterFunctions::isLetter (t[0]))
+    {
+        static const int base[7] = { 9, 11, 0, 2, 4, 5, 7 }; // A B C D E F G
+        const auto c = juce::CharacterFunctions::toUpperCase (t[0]);
+        if (c >= 'A' && c <= 'G')
+        {
+            int semi = base[c - 'A'], pos = 1;
+            if (t[pos] == '#') { ++semi; ++pos; }
+            else if (t[pos] == 'b') { --semi; ++pos; }
+            return (float) juce::jlimit (0, 127, (t.substring (pos).getIntValue() + 2) * 12 + semi);
+        }
+    }
+
+    if (p.fmt == kf::F_CHOICE && juce::CharacterFunctions::isLetter (t[0]))
+    {
+        juce::StringArray c;
+        c.addTokens (p.choices != nullptr ? p.choices : "", "|", "");
+        for (int i = 0; i < c.size(); ++i)
+            if (c[i].startsWithIgnoreCase (t)) return (float) i;
+        return current;
+    }
+
+    double v = t.retainCharacters ("0123456789.-").getDoubleValue();
+    if (t.containsIgnoreCase ("k")) v *= 1000.0;
+    if (p.fmt == kf::F_PCT) v /= 100.0;
+    if (p.fmt == kf::F_MS && t.containsIgnoreCase ("s") && ! t.containsIgnoreCase ("ms")) v *= 1000.0;
+    return (float) v;
 }
 
 inline double parseNumber (const juce::String& t)
@@ -47,13 +124,65 @@ public:
     void mouseEnter (const juce::MouseEvent& e) override { juce::Slider::mouseEnter (e); startTimerHz (60); }
     void mouseExit (const juce::MouseEvent& e) override { juce::Slider::mouseExit (e); startTimerHz (60); }
 
+    // Holding Shift while dragging gives fine control
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu() && onRightClick) { onRightClick(); return; }
+        fine = false;
+        juce::Slider::mouseDown (e);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) return;
+        const bool shift = e.mods.isShiftDown();
+
+        if (shift && ! fine)
+        {
+            fine = true;
+            fineStart = valueToProportionOfLength (getValue());
+            fineX = e.position.x;
+            fineY = e.position.y;
+        }
+        else if (! shift && fine)
+        {
+            fine = false;
+            juce::Slider::mouseUp (e);
+            juce::Slider::mouseDown (e);
+        }
+
+        if (fine)
+        {
+            const bool horiz = getSliderStyle() == juce::Slider::LinearHorizontal;
+            const double d = horiz ? (double) (e.position.x - fineX) : (double) (fineY - e.position.y);
+            setValue (proportionOfLengthToValue (juce::jlimit (0.0, 1.0, fineStart + d / 1500.0)), juce::sendNotificationSync);
+        }
+        else
+        {
+            juce::Slider::mouseDrag (e);
+        }
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override { fine = false; juce::Slider::mouseUp (e); }
+
+    void poke() { startTimerHz (60); }
+
+    struct ModRing { float from, to; juce::Colour col; };
+
     juce::Colour accent { 0xff3fa7ff };
-    float hover = 0.0f;
+    float hover = 0.0f, zeroPos = -1.0f, modValue = -1.0f;
+    bool dropGlow = false;
+    std::vector<ModRing> rings;
+    std::function<void()> onRightClick;
 
 private:
+    bool fine = false;
+    double fineStart = 0.0;
+    float fineX = 0.0f, fineY = 0.0f;
+
     void timerCallback() override
     {
-        const float target = isMouseOverOrDragging (true) ? 1.0f : 0.0f;
+        const float target = isMouseOverOrDragging (true) || dropGlow ? 1.0f : 0.0f;
         hover += (target - hover) * 0.25f;
 
         if (std::abs (hover - target) < 0.02f)
@@ -111,7 +240,8 @@ public:
         g.strokePath (track, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
         const double mn = s.getMinimum(), mx = s.getMaximum();
-        const float zeroPos = (mn < 0.0 && mx > 0.0) ? (float) ((0.0 - mn) / (mx - mn)) : 0.0f;
+        const float zeroPos = (ks != nullptr && ks->zeroPos >= 0.0f) ? ks->zeroPos
+                              : ((mn < 0.0 && mx > 0.0) ? (float) ((0.0 - mn) / (mx - mn)) : 0.0f);
         const float zeroAngle = startAngle + zeroPos * (endAngle - startAngle);
 
         juce::Path val;
@@ -120,6 +250,26 @@ public:
         g.strokePath (val, juce::PathStrokeType (7.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         g.setColour (accent);
         g.strokePath (val, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        if (ks != nullptr)
+        {
+            for (const auto& rg : ks->rings)
+            {
+                juce::Path rp;
+                const float a0 = startAngle + std::min (rg.from, rg.to) * (endAngle - startAngle);
+                const float a1 = startAngle + std::max (rg.from, rg.to) * (endAngle - startAngle);
+                rp.addCentredArc (c.x, c.y, ar + 4.0f, ar + 4.0f, 0.0f, a0, std::max (a1, a0 + 0.02f), true);
+                g.setColour (rg.col.withAlpha (0.9f));
+                g.strokePath (rp, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            }
+
+            if (ks->modValue >= 0.0f && ! ks->rings.empty())
+            {
+                const float ma = startAngle + ks->modValue * (endAngle - startAngle);
+                g.setColour (juce::Colours::white);
+                g.fillEllipse (c.x + std::sin (ma) * (ar + 4.0f) - 2.5f, c.y - std::cos (ma) * (ar + 4.0f) - 2.5f, 5.0f, 5.0f);
+            }
+        }
 
         const float pr = radius * 0.72f;
         g.setColour (juce::Colours::white.withAlpha (0.92f));
@@ -139,6 +289,22 @@ public:
         g.fillRoundedRectangle ((float) x, cy - 2.0f, (float) w, 4.0f, 2.0f);
         g.setColour (accent.withAlpha (0.9f));
         g.fillRoundedRectangle ((float) x, cy - 2.0f, std::max (0.0f, sliderPos - (float) x), 4.0f, 2.0f);
+        if (ks != nullptr)
+        {
+            for (const auto& rg : ks->rings)
+            {
+                g.setColour (rg.col.withAlpha (0.9f));
+                const float x0 = (float) x + std::min (rg.from, rg.to) * (float) w, x1 = (float) x + std::max (rg.from, rg.to) * (float) w;
+                g.fillRoundedRectangle (x0, cy - 8.0f, std::max (2.0f, x1 - x0), 2.5f, 1.0f);
+            }
+
+            if (ks->modValue >= 0.0f && ! ks->rings.empty())
+            {
+                g.setColour (juce::Colours::white);
+                g.fillEllipse ((float) x + ks->modValue * (float) w - 2.5f, cy - 9.0f, 5.0f, 5.0f);
+            }
+        }
+
         g.setColour (accent.withAlpha (0.15f + 0.2f * hover));
         g.fillEllipse (sliderPos - 9.0f, cy - 9.0f, 18.0f, 18.0f);
         g.setColour (accent.brighter (0.3f));

@@ -5,7 +5,7 @@ if(APPLE)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 endif()
 
-project(KickForge VERSION 0.2.0)
+project(KickForge VERSION 0.3.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,10 +44,17 @@ target_sources(KickForge PRIVATE
     Source/PluginProcessor.h
     Source/PluginEditor.cpp
     Source/PluginEditor.h
+    Source/Engine.h
+    Source/Store.h
     Source/Dsp.h
-    Source/Params.h
+    Source/Dsp2.h
+    Source/FxLib.h
     Source/UiKit.h
-    Source/Panels.h)
+    Source/Bind.h
+    Source/FxPanels.h
+    Source/LayerPanels.h
+    Source/ModPanel.h
+    Source/Viz.h)
 
 target_compile_definitions(KickForge PUBLIC
     JUCE_WEB_BROWSER=0

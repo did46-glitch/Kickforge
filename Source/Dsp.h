@@ -83,6 +83,18 @@ struct Biquad
         set ((1.0f + c) * 0.5f, -(1.0f + c), (1.0f + c) * 0.5f, 1.0f + al, -2.0f * c, 1.0f - al);
     }
 
+    void setNotch (float f, float q, double sr)
+    {
+        const float w = kTwoPi * limitFreq (f, sr) / (float) sr, c = std::cos (w), al = std::sin (w) / (2.0f * q);
+        set (1.0f, -2.0f * c, 1.0f, 1.0f + al, -2.0f * c, 1.0f - al);
+    }
+
+    void setBandpass (float f, float q, double sr)
+    {
+        const float w = kTwoPi * limitFreq (f, sr) / (float) sr, c = std::cos (w), al = std::sin (w) / (2.0f * q);
+        set (al, 0.0f, -al, 1.0f + al, -2.0f * c, 1.0f - al);
+    }
+
     void setPeak (float f, float q, float gDb, double sr)
     {
         const float A = std::pow (10.0f, gDb / 40.0f);
@@ -142,13 +154,13 @@ struct LR4
 // Parameter snapshots (what the audio thread reads each chunk)
 struct TransParams  { bool on = false; float attack = 0.0f, sustain = 0.0f; };
 struct ShiftParams  { bool on = false; float hz = 0.0f, mix = 1.0f; };
-struct DistParams   { bool on = false; int type = 0; float drive = 0.3f, shape = 0.0f, tone = 20000.0f, mix = 1.0f; };
+struct DistParams   { bool on = false; int type = 0; int stages = 1; float drive = 0.3f, shape = 0.0f, tone = 20000.0f, mix = 1.0f; };
 struct ClipParams   { bool on = false; float driveDb = 0.0f, ceilDb = 0.0f, soft = 0.0f; };
 struct EqParams     { bool on = false; float lsF = 60.0f, lsG = 0.0f, m1F = 120.0f, m1G = 0.0f, m1Q = 1.0f,
                                          m2F = 2500.0f, m2G = 0.0f, m2Q = 1.0f, hsF = 8000.0f, hsG = 0.0f; };
 struct MbParams     { bool on = false; float f1 = 120.0f, f2 = 2500.0f, t1 = -18.0f, t2 = -18.0f, t3 = -18.0f,
                                          ratio = 4.0f, makeup = 0.0f; };
-struct ReverbParams { bool on = false; float size = 0.35f, damp = 0.5f, mix = 0.2f; };
+struct ReverbParams { bool on = false; float size = 0.35f, damp = 0.5f, mix = 0.2f, width = 1.0f; };
 
 struct FxParams
 {
@@ -323,8 +335,10 @@ public:
             const float lv = std::pow (2.0f, 15.0f - p.drive * 14.0f);
             return std::round (x * lv) / lv;
         }
-        const float g = driveGain (p.drive);
-        return shapeSample (x, p.type, g, compFor (g), p.shape);
+        const float g = driveGain (p.drive), c = compFor (g);
+        float y = x;
+        for (int s = 0; s < std::max (1, p.stages); ++s) y = shapeSample (y, p.type, g, c, p.shape);
+        return y;
     }
 
     void process (float* l, float* r, int n, const DistParams& p)
@@ -333,6 +347,7 @@ public:
         const bool crush = p.type == 4;
         const float levels = std::pow (2.0f, 15.0f - p.drive * 14.0f);
         const int hold = 1 + (int) (p.shape * 40.0f);
+        const int stages = std::max (1, std::min (4, p.stages));
         const bool useTone = p.tone < 19000.0f;
         float* d[2] = { l, r };
 
@@ -354,7 +369,8 @@ public:
                 }
                 else
                 {
-                    wet = shapeSample (x, p.type, g, comp, p.shape);
+                    wet = x;
+                    for (int s = 0; s < stages; ++s) wet = shapeSample (wet, p.type, g, comp, p.shape);
                     const float y = wet - dcX[c] + dcR * dcY[c];
                     dcX[c] = wet;
                     dcY[c] = y;
@@ -537,7 +553,7 @@ public:
         rp.damping = p.damp;
         rp.wetLevel = 0.33f * p.mix;
         rp.dryLevel = 0.5f * (1.0f - p.mix);
-        rp.width = 1.0f;
+        rp.width = p.width;
         rp.freezeMode = 0.0f;
         rev.setParameters (rp);
         rev.processStereo (l, r, n);

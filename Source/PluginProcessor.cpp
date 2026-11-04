@@ -1,265 +1,40 @@
 #include "PluginProcessor.h"
+#include "Engine.h"
 #include "PluginEditor.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
-//==============================================================================
-// The audio engine: six sample voices (with drawable volume shaper), one FX rack
-// per layer, a master FX rack. One instance runs live, one renders the preview.
-class Engine
+static juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
 {
-public:
-    explicit Engine (KickForgeAudioProcessor& o) : owner (o) { prepare (44100.0); }
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "out", 1 }, "Output",
+                                                             juce::NormalisableRange<float> (-24.0f, 6.0f, 0.1f), 0.0f));
 
-    void prepare (double sampleRate)
-    {
-        sr = sampleRate;
-        for (auto& f : fx) f.prepare (sr);
-        for (auto& s : volSm)  { s.prepare (sr, 4.0f); s.snap (1.0f); }
-        for (auto& s : gateSm) { s.prepare (sr, 5.0f); s.snap (1.0f); }
-        outSm.prepare (sr, 4.0f);
-        outSm.snap (kf::dbToGain (owner.readOutDb()));
-        reset();
-    }
+    for (int i = 0; i < 4; ++i)
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "macro" + juce::String (i + 1), 1 },
+                                                                 "Macro " + juce::String (i + 1),
+                                                                 juce::NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
+    return layout;
+}
 
-    void reset()
-    {
-        for (auto& v : voices) { v.sample.reset(); v.pos = 0.0; v.delay = 0; v.active = false; }
-        for (auto& f : fx) f.reset();
-        clearPeaks();
-        sinceTrigger = 0;
-    }
-
-    // note < 0 means "play at the original pitch, ignore key follow"
-    void trigger (int note)
-    {
-        std::array<LayerSnap, kNumSlots> snaps;
-
-        for (int i = 0; i < kNumSlots; ++i)
-        {
-            owner.readLayer (i, snaps[(size_t) i]);
-            const auto& s = snaps[(size_t) i];
-            auto& v = voices[(size_t) i];
-
-            v.sample = owner.getSample (i);
-            v.pos = 0.0;
-            v.active = (v.sample != nullptr);
-            volSm[(size_t) i].snap (layerGain (s));
-
-            if (! v.active)
-                continue;
-
-            float semis = s.pit;
-            if (note >= 0 && s.ktrk)
-                semis += (float) (note - s.root);
-
-            v.rate = std::pow (2.0, (double) semis / 12.0) * v.sample->sampleRate / sr;
-            v.delay = (int) std::lround ((double) s.off * 0.001 * sr);
-        }
-
-        sinceTrigger = 0;
-    }
-
-    void render (juce::AudioBuffer<float>& out, int start, int num,
-                 std::array<juce::AudioBuffer<float>, kNumSlots>* cap)
-    {
-        float* oL = out.getWritePointer (0);
-        float* oR = out.getNumChannels() > 1 ? out.getWritePointer (1) : oL;
-
-        const kf::FxParams masterFx = owner.readFx (kNumSlots);
-        std::array<LayerSnap, kNumSlots> snaps;
-
-        while (num > 0)
-        {
-            const int n = std::min (num, kChunk);
-
-            bool anySolo = false;
-            for (int i = 0; i < kNumSlots; ++i)
-            {
-                owner.readLayer (i, snaps[(size_t) i]);
-                anySolo = anySolo || snaps[(size_t) i].solo;
-            }
-
-            for (int i = 0; i < kNumSlots; ++i)
-            {
-                const auto& s = snaps[(size_t) i];
-
-                std::fill (tmpL, tmpL + n, 0.0f);
-                std::fill (tmpR, tmpR + n, 0.0f);
-
-                volSm[(size_t) i].set (layerGain (s));
-                generate (i, n);
-                fx[(size_t) i].process (tmpL, tmpR, n, s.fx);
-
-                if (cap != nullptr)
-                {
-                    float* cL = (*cap)[(size_t) i].getWritePointer (0);
-                    float* cR = (*cap)[(size_t) i].getWritePointer (1);
-                    for (int k = 0; k < n; ++k) { cL[start + k] = tmpL[k]; cR[start + k] = tmpR[k]; }
-                }
-
-                const bool audible = ! s.mute && (! anySolo || s.solo);
-                gateSm[(size_t) i].set (audible ? 1.0f : 0.0f);
-
-                float pk = 0.0f;
-                for (int k = 0; k < n; ++k)
-                {
-                    const float gate = gateSm[(size_t) i].next();
-                    const float a = tmpL[k] * gate, b = tmpR[k] * gate;
-                    oL[start + k] += a;
-                    oR[start + k] += b;
-                    pk = std::max (pk, std::max (std::fabs (a), std::fabs (b)));
-                }
-                peaks[(size_t) i] = std::max (peaks[(size_t) i], pk);
-            }
-
-            fx[(size_t) kNumSlots].process (oL + start, oR + start, n, masterFx);
-
-            outSm.set (kf::dbToGain (owner.readOutDb()));
-            for (int k = 0; k < n; ++k)
-            {
-                const float g = outSm.next();
-                const float a = kf::clampf (oL[start + k] * g, -1.0f, 1.0f);
-                const float b = kf::clampf (oR[start + k] * g, -1.0f, 1.0f);
-                oL[start + k] = a;
-                oR[start + k] = b;
-                masterPeak = std::max (masterPeak, std::max (std::fabs (a), std::fabs (b)));
-            }
-
-            sinceTrigger += n;
-            start += n;
-            num -= n;
-        }
-    }
-
-    double longestSeconds() const
-    {
-        double longest = 0.0;
-        for (const auto& v : voices)
-            if (v.active && v.sample != nullptr && v.rate > 0.0)
-                longest = std::max (longest, ((double) v.delay + (double) v.sample->audio.getNumSamples() / v.rate) / sr);
-        return longest;
-    }
-
-    bool anyReverbOn() const
-    {
-        for (int s = 0; s < kNumScopes; ++s)
-            if (owner.getFxValue (s, R_ON) > 0.5f) return true;
-        return false;
-    }
-
-    bool anyActive() const { for (const auto& v : voices) if (v.active) return true; return false; }
-    double secondsSinceTrigger() const { return (double) sinceTrigger / sr; }
-    float peak (int i) const { return peaks[(size_t) i]; }
-    float masterPeakValue() const { return masterPeak; }
-    void clearPeaks() { peaks.fill (0.0f); masterPeak = 0.0f; }
-
-    float progress (int i) const
-    {
-        const auto& v = voices[(size_t) i];
-        if (! v.active || v.sample == nullptr) return -1.0f;
-        return (float) (v.pos / (double) v.sample->audio.getNumSamples());
-    }
-
-private:
-    struct Voice
-    {
-        std::shared_ptr<KickSample> sample;
-        double pos = 0.0, rate = 1.0;
-        int delay = 0;
-        bool active = false;
-    };
-
-    static float layerGain (const LayerSnap& s)
-    {
-        return (s.vol <= -59.9f ? 0.0f : kf::dbToGain (s.vol)) * (s.pol ? -1.0f : 1.0f);
-    }
-
-    void generate (int i, int n)
-    {
-        auto& v = voices[(size_t) i];
-        if (! v.active || v.sample == nullptr)
-            return;
-
-        const auto& a = v.sample->audio;
-        const int len = a.getNumSamples();
-        const float* l = a.getReadPointer (0);
-        const float* r = a.getReadPointer (a.getNumChannels() > 1 ? 1 : 0);
-        const auto& table = owner.getShaperTable (i);
-        auto& vs = volSm[(size_t) i];
-
-        for (int k = 0; k < n; ++k)
-        {
-            if (v.delay > 0) { --v.delay; continue; }
-
-            const int idx = (int) v.pos;
-            if (idx + 1 >= len) { v.active = false; break; }
-
-            const float frac = (float) (v.pos - (double) idx);
-            const float sl = l[idx] + frac * (l[idx + 1] - l[idx]);
-            const float sR = r[idx] + frac * (r[idx + 1] - r[idx]);
-
-            const float u = (float) (v.pos / (double) len) * (float) (kShaperN - 1);
-            const int i0 = std::min ((int) u, kShaperN - 2);
-            const float f = u - (float) i0;
-            const float e = table[(size_t) i0].load (std::memory_order_relaxed) * (1.0f - f)
-                          + table[(size_t) i0 + 1].load (std::memory_order_relaxed) * f;
-
-            const float g = vs.next() * e;
-            tmpL[k] += sl * g;
-            tmpR[k] += sR * g;
-            v.pos += v.rate;
-        }
-    }
-
-    static constexpr int kChunk = 256;
-
-    KickForgeAudioProcessor& owner;
-    double sr = 44100.0;
-    std::array<Voice, kNumSlots> voices;
-    std::array<kf::FxChain, kNumScopes> fx;
-    std::array<kf::Smoother, kNumSlots> volSm, gateSm;
-    kf::Smoother outSm;
-    std::array<float, kNumSlots> peaks {};
-    float masterPeak = 0.0f;
-    juce::int64 sinceTrigger = 0;
-    float tmpL[kChunk], tmpR[kChunk];
-};
-
-//==============================================================================
 KickForgeAudioProcessor::KickForgeAudioProcessor()
     : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      apvts (*this, nullptr, "KICKFORGE", createParameterLayout())
+      apvts (*this, nullptr, "KICKFORGE3", createLayout())
 {
     formatManager.registerBasicFormats();
 
-    for (int s = 0; s < kNumScopes; ++s)
-    {
-        if (s < kNumSlots)
-            for (int i = 0; i < L_COUNT; ++i)
-            {
-                layerP[(size_t) s][(size_t) i] = apvts.getRawParameterValue (layerParamId (s, i));
-                allParams.push_back (layerP[(size_t) s][(size_t) i]);
-            }
-
-        for (int i = 0; i < FX_COUNT; ++i)
-        {
-            fxP[(size_t) s][(size_t) i] = apvts.getRawParameterValue (fxParamId (s, i));
-            allParams.push_back (fxP[(size_t) s][(size_t) i]);
-        }
-    }
-
     outP = apvts.getRawParameterValue ("out");
-    allParams.push_back (outP);
+    for (int i = 0; i < 4; ++i) macroP[(size_t) i] = apvts.getRawParameterValue ("macro" + juce::String (i + 1));
 
-    for (auto& row : shaper) for (auto& a : row) a.store (1.0f);
     for (auto& a : sampleVersion) a.store (0);
     for (auto& a : levels) a.store (0.0f);
     for (auto& a : progress) a.store (-1.0f);
+    for (auto& a : rackVer) a.store (0);
+    for (int s = 0; s < kNumScopes; ++s) liveRack[(size_t) s] = buildRack (s, currentSampleRate);
 
-    liveEngine = std::make_unique<Engine> (*this);
-    previewEngine = std::make_unique<Engine> (*this);
+    liveEngine = std::make_unique<Engine> (*this, true);
+    previewEngine = std::make_unique<Engine> (*this, false);
 }
 
 KickForgeAudioProcessor::~KickForgeAudioProcessor() = default;
@@ -267,6 +42,7 @@ KickForgeAudioProcessor::~KickForgeAudioProcessor() = default;
 void KickForgeAudioProcessor::prepareToPlay (double sampleRate, int)
 {
     currentSampleRate = sampleRate;
+    for (int s = 0; s < kNumScopes; ++s) rebuildLive (s);
     liveEngine->prepare (sampleRate);
 }
 
@@ -275,49 +51,21 @@ bool KickForgeAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts
     return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
 }
 
-//==============================================================================
-void KickForgeAudioProcessor::readLayer (int layer, LayerSnap& s) const
+float KickForgeAudioProcessor::getReal (int idx) const
 {
-    const auto& p = layerP[(size_t) layer];
-    s.vol = p[L_VOL]->load();
-    s.pit = p[L_PIT]->load();
-    s.off = p[L_OFF]->load();
-    s.root = (int) std::lround (p[L_ROOT]->load());
-    s.mute = p[L_MUTE]->load() > 0.5f;
-    s.solo = p[L_SOLO]->load() > 0.5f;
-    s.ktrk = p[L_KTRK]->load() > 0.5f;
-    s.pol = p[L_POL]->load() > 0.5f;
-    s.fx = readFx (layer);
+    if (auto* pi = info (idx)) return kf::toReal (*pi, getN (idx));
+    return 0.0f;
 }
 
-kf::FxParams KickForgeAudioProcessor::readFx (int scope) const
+void KickForgeAudioProcessor::setReal (int idx, float real)
 {
-    const auto& p = fxP[(size_t) scope];
-    auto v = [&p] (int i) { return p[(size_t) i]->load(); };
+    if (auto* pi = info (idx)) setN (idx, kf::toNorm (*pi, real));
+}
 
-    kf::FxParams f;
-    f.trans.on = v (T_ON) > 0.5f;  f.trans.attack = v (T_ATK);  f.trans.sustain = v (T_SUS);
-    f.shift.on = v (S_ON) > 0.5f;  f.shift.hz = v (S_HZ);       f.shift.mix = v (S_MIX);
-
-    f.dist.on = v (D_ON) > 0.5f;
-    f.dist.type = juce::jlimit (0, 6, (int) std::lround (v (D_TYPE)));
-    f.dist.drive = v (D_DRIVE);  f.dist.shape = v (D_SHAPE);  f.dist.tone = v (D_TONE);  f.dist.mix = v (D_MIX);
-
-    f.clip.on = v (C_ON) > 0.5f;  f.clip.driveDb = v (C_DRIVE);  f.clip.ceilDb = v (C_CEIL);  f.clip.soft = v (C_SOFT);
-
-    f.eq.on = v (E_ON) > 0.5f;
-    f.eq.lsF = v (E_LSF);  f.eq.lsG = v (E_LSG);
-    f.eq.m1F = v (E_M1F);  f.eq.m1G = v (E_M1G);  f.eq.m1Q = v (E_M1Q);
-    f.eq.m2F = v (E_M2F);  f.eq.m2G = v (E_M2G);  f.eq.m2Q = v (E_M2Q);
-    f.eq.hsF = v (E_HSF);  f.eq.hsG = v (E_HSG);
-
-    f.mb.on = v (M_ON) > 0.5f;
-    f.mb.f1 = v (M_F1);  f.mb.f2 = v (M_F2);
-    f.mb.t1 = v (M_T1);  f.mb.t2 = v (M_T2);  f.mb.t3 = v (M_T3);
-    f.mb.ratio = v (M_RATIO);  f.mb.makeup = v (M_MAKEUP);
-
-    f.rev.on = v (R_ON) > 0.5f;  f.rev.size = v (R_SIZE);  f.rev.damp = v (R_DAMP);  f.rev.mix = v (R_MIX);
-    return f;
+float KickForgeAudioProcessor::defaultN (int idx) const
+{
+    if (auto* pi = info (idx)) return kf::toNorm (*pi, pi->def);
+    return 0.0f;
 }
 
 //==============================================================================
@@ -327,6 +75,17 @@ void KickForgeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
 
     buffer.clear();
     const int numSamples = buffer.getNumSamples();
+
+    double bpm = hostBpm.load();
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition())
+            if (auto b = (*pos).getBpm())
+            {
+                bpm = *b;
+                hostBpm.store (bpm);
+            }
+
+    liveEngine->setBpm (bpm);
 
     if (previewRequested.exchange (false))
         liveEngine->trigger (-1);
@@ -340,7 +99,7 @@ void KickForgeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
 
         if (pos > cursor)
         {
-            liveEngine->render (buffer, cursor, pos - cursor, nullptr);
+            liveEngine->render (buffer, cursor, pos - cursor, nullptr, bpm);
             cursor = pos;
         }
 
@@ -349,7 +108,7 @@ void KickForgeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     }
 
     if (cursor < numSamples)
-        liveEngine->render (buffer, cursor, numSamples - cursor, nullptr);
+        liveEngine->render (buffer, cursor, numSamples - cursor, nullptr, bpm);
 
     for (int i = 0; i < kNumSlots; ++i)
     {
@@ -389,7 +148,21 @@ bool KickForgeAudioProcessor::loadSample (int slot, const juce::File& file)
     }
 
     ++sampleVersion[(size_t) slot];
+    ++store.version;
     return true;
+}
+
+void KickForgeAudioProcessor::clearSample (int slot)
+{
+    std::shared_ptr<KickSample> old;
+
+    {
+        const juce::SpinLock::ScopedLockType lock (sampleLock);
+        old.swap (samples[(size_t) slot]);
+    }
+
+    ++sampleVersion[(size_t) slot];
+    ++store.version;
 }
 
 std::shared_ptr<KickSample> KickForgeAudioProcessor::getSample (int slot) const
@@ -426,70 +199,601 @@ void KickForgeAudioProcessor::setMainFolder (const juce::File& folder)
 
 void KickForgeAudioProcessor::randomiseLayer (int slot, bool useLayerFolder)
 {
-    const auto dir = (useLayerFolder && layerFolder[(size_t) slot].isDirectory()) ? layerFolder[(size_t) slot] : mainFolder;
+    if (randOpts.samples)
+    {
+        const auto dir = (useLayerFolder && layerFolder[(size_t) slot].isDirectory()) ? layerFolder[(size_t) slot] : mainFolder;
 
-    if (! dir.isDirectory())
-        return;
+        if (dir.isDirectory())
+        {
+            const auto files = findSamples (dir);
+            if (! files.isEmpty()) loadSample (slot, files[random.nextInt (files.size())]);
+        }
+    }
 
-    const auto files = findSamples (dir);
+    if (randOpts.startEnd)
+    {
+        setReal (kf::layerIdx (slot, kf::LP_START), random.nextFloat() * random.nextFloat() * 40.0f);
+        setReal (kf::layerIdx (slot, kf::LP_END), random.nextFloat() * random.nextFloat() * 120.0f);
+    }
 
-    if (! files.isEmpty())
-        loadSample (slot, files[random.nextInt (files.size())]);
+    if (randOpts.pitch)
+        setReal (kf::layerIdx (slot, kf::LP_PITCH), (random.nextFloat() * 2.0f - 1.0f) * randOpts.pitchRange);
 }
 
 void KickForgeAudioProcessor::randomiseAll (bool useLayerFolders)
 {
-    for (int i = 0; i < kNumSlots; ++i)
-        if (getLayerValue (i, L_LOCK) < 0.5f)
-            randomiseLayer (i, useLayerFolders);
+    auto locked = [this] (int l) { return getReal (kf::layerIdx (l, kf::LP_LOCK)) > 0.5f; };
+
+    for (int l = 0; l < kNumSlots; ++l)
+        if (! locked (l))
+            randomiseLayer (l, useLayerFolders);
+
+    if (randOpts.fx)
+        for (int s = 0; s < kNumScopes; ++s)
+        {
+            if (s < kNumSlots && locked (s)) continue;
+
+            for (const auto& sv : getRack (s))
+            {
+                const auto& ti = kf::fxInfo (sv.type);
+                for (int k = 0; k < ti.n; ++k)
+                {
+                    if (ti.p[k].fmt == kf::F_CHOICE || ti.p[k].fmt == kf::F_BOOL) continue;
+                    const int idx = kf::slotIdx (s, sv.id, k);
+                    setN (idx, getN (idx) + (random.nextFloat() - 0.5f) * 2.0f * randOpts.amount);
+                }
+            }
+        }
+
+    if (randOpts.shapes)
+        for (int m = 0; m < kf::kMods; ++m)
+        {
+            if (routesForSource (m).empty()) continue;
+
+            float knot[7];
+            for (float& k : knot) k = random.nextFloat();
+            knot[0] = 1.0f;
+
+            for (int i = 0; i < kf::kShapeN; ++i)
+            {
+                const float u = (float) i / (float) (kf::kShapeN - 1) * 6.0f;
+                const int k0 = std::min (5, (int) u);
+                const float f = u - (float) k0, sm = f * f * (3.0f - 2.0f * f);
+                setShapePoint (m, i, knot[k0] + (knot[k0 + 1] - knot[k0]) * sm);
+            }
+        }
+
+    if (randOpts.routes)
+        for (int r = 0; r < kf::kMaxRoutes; ++r)
+            if (store.routes[r].src.load() >= 0 && store.routes[r].target.load() >= 0)
+                store.routes[r].amount.store (juce::jlimit (-1.0f, 1.0f, store.routes[r].amount.load() + (random.nextFloat() - 0.5f) * randOpts.amount * 2.0f));
+
+    ++store.version;
 }
 
 //==============================================================================
-// Volume shaper presets
-void KickForgeAudioProcessor::applyShaperPreset (int slot, int preset)
+// Effect racks
+std::vector<KickForgeAudioProcessor::SlotView> KickForgeAudioProcessor::getRack (int scope) const
 {
-    auto& t = shaper[(size_t) slot];
-    std::array<float, kShaperN> v;
+    const juce::ScopedLock sl (cfgLock);
+    std::vector<SlotView> out;
+    for (const auto& c : cfg[(size_t) scope]) out.push_back ({ c.id, c.type });
+    return out;
+}
 
-    for (int i = 0; i < kShaperN; ++i)
-        v[(size_t) i] = t[(size_t) i].load();
+int KickForgeAudioProcessor::findFreeSlot (int scope) const
+{
+    for (int id = 0; id < kf::kMaxSlots; ++id)
+        if (store.slotType[scope][id].load() < 0) return id;
+    return -1;
+}
 
-    for (int i = 0; i < kShaperN; ++i)
+static void clearRoutesInRange (kf::Store& st, int lo, int hi)
+{
+    for (auto& r : st.routes)
     {
-        const float u = (float) i / (float) (kShaperN - 1);
-        float& x = v[(size_t) i];
+        const int t = r.target.load();
+        if (t >= lo && t <= hi) { r.target.store (-1); r.src.store (-1); r.amount.store (0.0f); }
+    }
+}
 
-        switch (preset)
+int KickForgeAudioProcessor::addFx (int scope, int type, int pos)
+{
+    const juce::ScopedLock sl (cfgLock);
+    const int id = findFreeSlot (scope);
+    if (id < 0) return -1;
+
+    kf::applySlotDefaults (store, scope, id, juce::jlimit (0, kf::FX_COUNT - 1, type));
+    auto& c = cfg[(size_t) scope];
+    if (pos < 0 || pos > (int) c.size()) pos = (int) c.size();
+    c.insert (c.begin() + pos, SlotCfg { id, type });
+
+    ++store.version;
+    rebuildLive (scope);
+    return id;
+}
+
+void KickForgeAudioProcessor::removeFx (int scope, int slotId)
+{
+    const juce::ScopedLock sl (cfgLock);
+    auto& c = cfg[(size_t) scope];
+    c.erase (std::remove_if (c.begin(), c.end(), [slotId] (const SlotCfg& s) { return s.id == slotId; }), c.end());
+
+    clearRoutesInRange (store, kf::slotIdx (scope, slotId, 0), kf::slotIdx (scope, slotId, kf::kSlotStride - 1));
+    store.slotType[scope][slotId].store (-1);
+    for (int k = 0; k < kf::kSlotStride; ++k) store.v[(size_t) kf::slotIdx (scope, slotId, k)].store (0.0f);
+
+    ++store.version;
+    rebuildLive (scope);
+}
+
+void KickForgeAudioProcessor::moveFx (int scope, int fromPos, int toPos)
+{
+    const juce::ScopedLock sl (cfgLock);
+    auto& c = cfg[(size_t) scope];
+    if (fromPos < 0 || fromPos >= (int) c.size() || toPos < 0 || toPos >= (int) c.size() || fromPos == toPos) return;
+
+    const SlotCfg item = c[(size_t) fromPos];
+    c.erase (c.begin() + fromPos);
+    c.insert (c.begin() + toPos, item);
+
+    ++store.version;
+    rebuildLive (scope);
+}
+
+void KickForgeAudioProcessor::changeFxType (int scope, int slotId, int type)
+{
+    const juce::ScopedLock sl (cfgLock);
+    for (auto& s : cfg[(size_t) scope])
+        if (s.id == slotId)
         {
-            case 0: x = 1.0f; break;
-            case 1: x = std::exp (-7.0f * u); break;
-            case 2: { const float k = kf::clampf (1.0f - (u - 0.04f) / 0.14f, 0.0f, 1.0f); x = k * k; break; }
-            case 3: x = std::exp (-2.5f * u); break;
-            case 4: x = 1.0f - u; break;
-            case 6: x = 1.0f - x; break;
-            default: break;
+            s.type = type;
+            clearRoutesInRange (store, kf::slotIdx (scope, slotId, 0), kf::slotIdx (scope, slotId, kf::kSlotStride - 1));
+            kf::applySlotDefaults (store, scope, slotId, type);
+        }
+
+    ++store.version;
+    rebuildLive (scope);
+}
+
+int KickForgeAudioProcessor::duplicateFx (int scope, int slotId)
+{
+    const juce::ScopedLock sl (cfgLock);
+    const auto& c = cfg[(size_t) scope];
+    for (size_t i = 0; i < c.size(); ++i)
+        if (c[i].id == slotId)
+        {
+            const int type = c[i].type;
+            const int nid = addFx (scope, type, (int) i + 1);
+            if (nid >= 0)
+                for (int k = 0; k < kf::kSlotStride; ++k)
+                    store.v[(size_t) kf::slotIdx (scope, nid, k)].store (store.v[(size_t) kf::slotIdx (scope, slotId, k)].load());
+            return nid;
+        }
+
+    return -1;
+}
+
+void KickForgeAudioProcessor::clearRack (int scope)
+{
+    const juce::ScopedLock sl (cfgLock);
+    for (const auto& s : std::vector<SlotCfg> (cfg[(size_t) scope]))
+    {
+        clearRoutesInRange (store, kf::slotIdx (scope, s.id, 0), kf::slotIdx (scope, s.id, kf::kSlotStride - 1));
+        store.slotType[scope][s.id].store (-1);
+        for (int k = 0; k < kf::kSlotStride; ++k) store.v[(size_t) kf::slotIdx (scope, s.id, k)].store (0.0f);
+    }
+
+    cfg[(size_t) scope].clear();
+    ++store.version;
+    rebuildLive (scope);
+}
+
+std::shared_ptr<RackRt> KickForgeAudioProcessor::buildRack (int scope, double sr) const
+{
+    const juce::ScopedLock sl (cfgLock);
+    auto rack = std::make_shared<RackRt>();
+
+    for (const auto& c : cfg[(size_t) scope])
+    {
+        RackRt::Item it;
+        it.slotId = c.id;
+        it.type = c.type;
+        it.fx = kf::makeFx (c.type);
+        it.fx->prepare (sr);
+        for (float& x : it.cacheN) x = -1.0f;
+        for (float& x : it.real) x = 0.0f;
+        rack->items.push_back (std::move (it));
+    }
+
+    return rack;
+}
+
+void KickForgeAudioProcessor::rebuildLive (int scope)
+{
+    collectGarbage();
+    auto fresh = buildRack (scope, currentSampleRate);
+
+    {
+        const juce::SpinLock::ScopedLockType lock (liveLock);
+        graveyard.push_back (std::move (liveRack[(size_t) scope]));
+        liveRack[(size_t) scope] = std::move (fresh);
+        ++rackVer[(size_t) scope];
+    }
+
+    graveyardTime = juce::Time::getMillisecondCounterHiRes();
+}
+
+bool KickForgeAudioProcessor::fetchLiveRack (int scope, std::shared_ptr<RackRt>& dst, int& ver) const
+{
+    const juce::SpinLock::ScopedTryLockType lock (liveLock);
+    if (! lock.isLocked()) return false;
+
+    dst = liveRack[(size_t) scope];
+    ver = rackVer[(size_t) scope].load();
+    return true;
+}
+
+void KickForgeAudioProcessor::collectGarbage()
+{
+    if (! graveyard.empty() && juce::Time::getMillisecondCounterHiRes() - graveyardTime > 1500.0)
+        graveyard.clear();
+}
+
+//==============================================================================
+// Modulation routing
+int KickForgeAudioProcessor::addRoute (int src, int target, int mode, float amount)
+{
+    for (int r = 0; r < kf::kMaxRoutes; ++r)
+        if (store.routes[r].src.load() == src && store.routes[r].target.load() == target) return r;
+
+    for (int r = 0; r < kf::kMaxRoutes; ++r)
+        if (store.routes[r].src.load() < 0)
+        {
+            auto& rt = store.routes[r];
+            rt.target.store (-1);
+            rt.src.store (src);
+            rt.mode.store (mode);
+            rt.amount.store (amount);
+            rt.target.store (target);
+            ++store.version;
+            return r;
+        }
+
+    return -1;
+}
+
+void KickForgeAudioProcessor::removeRoute (int r)
+{
+    if (r < 0 || r >= kf::kMaxRoutes) return;
+    store.routes[r].target.store (-1);
+    store.routes[r].src.store (-1);
+    store.routes[r].amount.store (0.0f);
+    ++store.version;
+}
+
+std::vector<int> KickForgeAudioProcessor::routesForTarget (int target) const
+{
+    std::vector<int> out;
+    for (int r = 0; r < kf::kMaxRoutes; ++r)
+        if (store.routes[r].src.load() >= 0 && store.routes[r].target.load() == target) out.push_back (r);
+    return out;
+}
+
+std::vector<int> KickForgeAudioProcessor::routesForSource (int src) const
+{
+    std::vector<int> out;
+    for (int r = 0; r < kf::kMaxRoutes; ++r)
+        if (store.routes[r].src.load() == src && store.routes[r].target.load() >= 0) out.push_back (r);
+    return out;
+}
+
+int KickForgeAudioProcessor::firstFreeModulator() const
+{
+    for (int m = 0; m < kf::kMods; ++m)
+        if (routesForSource (m).empty()) return m;
+    return -1;
+}
+
+void KickForgeAudioProcessor::smoothShape (int m)
+{
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        std::array<float, kf::kShapeN> tmp;
+        for (int i = 0; i < kf::kShapeN; ++i) tmp[(size_t) i] = getShapePoint (m, i);
+
+        for (int i = 0; i < kf::kShapeN; ++i)
+        {
+            float sum = 0.0f;
+            int count = 0;
+            for (int k = std::max (0, i - 3); k <= std::min (kf::kShapeN - 1, i + 3); ++k) { sum += tmp[(size_t) k]; ++count; }
+            store.shapes[(size_t) m][(size_t) i].store (sum / (float) count);
         }
     }
 
-    if (preset == 5)
+    ++store.version;
+}
+
+//==============================================================================
+// Init, presets and state
+void KickForgeAudioProcessor::initLayer (int l)
+{
+    clearSample (l);
+    clearRack (l);
+    clearRoutesInRange (store, kf::layerIdx (l, 0), kf::layerIdx (l, kf::kLayerStride - 1));
+
+    for (int p = 0; p < kf::LP_COUNT; ++p)
+        store.v[(size_t) kf::layerIdx (l, p)].store (kf::toNorm (kf::kLayerInfo[p], kf::kLayerInfo[p].def));
+
+    layerFolder[(size_t) l] = juce::File();
+    ++store.version;
+}
+
+void KickForgeAudioProcessor::initPatch()
+{
+    for (int l = 0; l < kNumSlots; ++l) initLayer (l);
+    clearRack (kNumScopes - 1);
+
+    for (auto& r : store.routes) { r.target.store (-1); r.src.store (-1); r.amount.store (0.0f); }
+
+    for (int m = 0; m < kf::kMods; ++m)
     {
-        for (int pass = 0; pass < 3; ++pass)
+        for (int p = 0; p < kf::MP_COUNT; ++p)
+            store.v[(size_t) kf::modIdx (m, p)].store (kf::toNorm (kf::kModInfo[p], kf::kModInfo[p].def));
+        store.setShapePreset (m, 4);
+    }
+
+    for (int g = 0; g < kf::GP_COUNT; ++g)
+        store.v[(size_t) kf::globIdx (g)].store (kf::toNorm (kf::kGlobalInfo[g], kf::kGlobalInfo[g].def));
+
+    for (auto id : { juce::String ("out"), juce::String ("macro1"), juce::String ("macro2"), juce::String ("macro3"), juce::String ("macro4") })
+        if (auto* p = apvts.getParameter (id))
+            p->setValueNotifyingHost (p->getDefaultValue());
+
+    patchName = "Init";
+    ++store.version;
+}
+
+juce::File KickForgeAudioProcessor::presetRoot (bool fxChains) const
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                   .getChildFile ("KickForge").getChildFile (fxChains ? "FX Chains" : "Patches");
+    dir.createDirectory();
+    return dir;
+}
+
+std::vector<juce::File> KickForgeAudioProcessor::listPresets (bool fxChains) const
+{
+    juce::Array<juce::File> files;
+    presetRoot (fxChains).findChildFiles (files, juce::File::findFiles, true, fxChains ? "*.kffx" : "*.kfpatch");
+    std::sort (files.begin(), files.end(), [] (const juce::File& a, const juce::File& b) { return a.getFullPathName() < b.getFullPathName(); });
+    return std::vector<juce::File> (files.begin(), files.end());
+}
+
+juce::ValueTree KickForgeAudioProcessor::toTree()
+{
+    juce::ValueTree t ("KF3");
+    t.setProperty ("name", patchName, nullptr);
+    t.setProperty ("folder", mainFolder.getFullPathName(), nullptr);
+
+    juce::String ps;
+    for (int i = 0; i < kf::kNumParams; ++i)
+        if (auto* pi = info (i))
+            if (std::fabs (getN (i) - kf::toNorm (*pi, pi->def)) > 1.0e-5f)
+                ps << i << ":" << juce::String (getN (i), 5) << ",";
+    t.setProperty ("params", ps, nullptr);
+
+    juce::String rs;
+    {
+        const juce::ScopedLock sl (cfgLock);
+        for (int s = 0; s < kNumScopes; ++s)
+            for (const auto& c : cfg[(size_t) s]) rs << s << "." << c.id << "." << c.type << ",";
+    }
+    t.setProperty ("racks", rs, nullptr);
+
+    juce::String routes;
+    for (const auto& r : store.routes)
+        if (r.src.load() >= 0 && r.target.load() >= 0)
+            routes << r.src.load() << "," << r.target.load() << "," << r.mode.load() << "," << juce::String (r.amount.load(), 4) << ";";
+    t.setProperty ("routes", routes, nullptr);
+
+    for (int m = 0; m < kf::kMods; ++m)
+    {
+        juce::StringArray pts;
+        for (int i = 0; i < kf::kShapeN; ++i) pts.add (juce::String (getShapePoint (m, i), 3));
+        t.setProperty ("shape" + juce::String (m), pts.joinIntoString (","), nullptr);
+    }
+
+    for (int l = 0; l < kNumSlots; ++l)
+    {
+        const auto s = getSample (l);
+        t.setProperty ("path" + juce::String (l), s != nullptr ? s->path : juce::String(), nullptr);
+        t.setProperty ("lfolder" + juce::String (l), layerFolder[(size_t) l].getFullPathName(), nullptr);
+    }
+
+    t.addChild (apvts.copyState(), -1, nullptr);
+    return t;
+}
+
+void KickForgeAudioProcessor::fromTree (const juce::ValueTree& t)
+{
+    initPatch();
+
+    patchName = t.getProperty ("name", "Init").toString();
+    mainFolder = juce::File (t.getProperty ("folder").toString());
+
+    {
+        const juce::ScopedLock sl (cfgLock);
+        juce::StringArray toks;
+        toks.addTokens (t.getProperty ("racks").toString(), ",", "");
+
+        for (const auto& tk : toks)
         {
-            std::array<float, kShaperN> tmp = v;
-            for (int i = 0; i < kShaperN; ++i)
+            juce::StringArray f;
+            f.addTokens (tk, ".", "");
+            if (f.size() != 3) continue;
+
+            const int s = f[0].getIntValue(), id = f[1].getIntValue(), type = f[2].getIntValue();
+            if (s < 0 || s >= kNumScopes || id < 0 || id >= kf::kMaxSlots || type < 0 || type >= kf::FX_COUNT) continue;
+            if (store.slotType[s][id].load() >= 0) continue;
+
+            kf::applySlotDefaults (store, s, id, type);
+            cfg[(size_t) s].push_back ({ id, type });
+        }
+    }
+
+    for (int s = 0; s < kNumScopes; ++s) rebuildLive (s);
+
+    {
+        juce::StringArray toks;
+        toks.addTokens (t.getProperty ("params").toString(), ",", "");
+
+        for (const auto& tk : toks)
+        {
+            const int c = tk.indexOfChar (':');
+            if (c < 1) continue;
+            const int idx = tk.substring (0, c).getIntValue();
+            if (info (idx) != nullptr) store.v[(size_t) idx].store (kf::clamp01 (tk.substring (c + 1).getFloatValue()));
+        }
+    }
+
+    {
+        juce::StringArray toks;
+        toks.addTokens (t.getProperty ("routes").toString(), ";", "");
+
+        for (const auto& tk : toks)
+        {
+            juce::StringArray f;
+            f.addTokens (tk, ",", "");
+            if (f.size() == 4)
             {
-                float sum = 0.0f;
-                int count = 0;
-                for (int k = std::max (0, i - 3); k <= std::min (kShaperN - 1, i + 3); ++k) { sum += tmp[(size_t) k]; ++count; }
-                v[(size_t) i] = sum / (float) count;
+                const int src = f[0].getIntValue(), target = f[1].getIntValue();
+                if (src >= 0 && src < kf::kSources && info (target) != nullptr)
+                    addRoute (src, target, f[2].getIntValue(), f[3].getFloatValue());
             }
         }
     }
 
-    for (int i = 0; i < kShaperN; ++i)
-        t[(size_t) i].store (juce::jlimit (0.0f, 1.0f, v[(size_t) i]), std::memory_order_relaxed);
+    for (int m = 0; m < kf::kMods; ++m)
+    {
+        juce::StringArray pts;
+        pts.addTokens (t.getProperty ("shape" + juce::String (m)).toString(), ",", "");
+        if (pts.size() == kf::kShapeN)
+            for (int i = 0; i < kf::kShapeN; ++i)
+                store.shapes[(size_t) m][(size_t) i].store (kf::clamp01 (pts[i].getFloatValue()));
+    }
 
-    ++shaperVersion;
+    for (int l = 0; l < kNumSlots; ++l)
+    {
+        const auto path = t.getProperty ("path" + juce::String (l)).toString();
+        if (path.isNotEmpty()) loadSample (l, juce::File (path));
+
+        const auto lf = t.getProperty ("lfolder" + juce::String (l)).toString();
+        layerFolder[(size_t) l] = lf.isNotEmpty() ? juce::File (lf) : juce::File();
+    }
+
+    const auto a = t.getChildWithName (apvts.state.getType());
+    if (a.isValid()) apvts.replaceState (a);
+
+    ++store.version;
+}
+
+bool KickForgeAudioProcessor::savePatch (const juce::String& name)
+{
+    if (name.trim().isEmpty()) return false;
+    patchName = name.trim();
+
+    auto tree = toTree();
+    tree.setProperty ("name", patchName, nullptr);
+
+    if (auto xml = tree.createXml())
+        return xml->writeTo (presetRoot (false).getChildFile (juce::File::createLegalFileName (patchName) + ".kfpatch"));
+
+    return false;
+}
+
+bool KickForgeAudioProcessor::loadPatch (const juce::File& file)
+{
+    if (auto xml = juce::parseXML (file))
+    {
+        const auto tree = juce::ValueTree::fromXml (*xml);
+        if (! tree.isValid() || ! tree.hasType ("KF3")) return false;
+
+        fromTree (tree);
+        patchName = file.getFileNameWithoutExtension();
+        return true;
+    }
+
+    return false;
+}
+
+bool KickForgeAudioProcessor::saveFxChain (int scope, const juce::String& name)
+{
+    if (name.trim().isEmpty()) return false;
+
+    juce::ValueTree t ("KFFX");
+    for (const auto& sv : getRack (scope))
+    {
+        juce::ValueTree s ("Slot");
+        const auto& ti = kf::fxInfo (sv.type);
+        juce::String vals;
+        for (int k = 0; k < ti.n; ++k) vals << juce::String (getN (kf::slotIdx (scope, sv.id, k)), 5) << ",";
+
+        s.setProperty ("type", sv.type, nullptr);
+        s.setProperty ("on", getN (kf::slotIdx (scope, sv.id, kf::kOnK)), nullptr);
+        s.setProperty ("p", vals, nullptr);
+        t.addChild (s, -1, nullptr);
+    }
+
+    if (auto xml = t.createXml())
+        return xml->writeTo (presetRoot (true).getChildFile (juce::File::createLegalFileName (name.trim()) + ".kffx"));
+
+    return false;
+}
+
+bool KickForgeAudioProcessor::loadFxChain (int scope, const juce::File& file)
+{
+    auto xml = juce::parseXML (file);
+    if (xml == nullptr) return false;
+
+    const auto t = juce::ValueTree::fromXml (*xml);
+    if (! t.isValid() || ! t.hasType ("KFFX")) return false;
+
+    clearRack (scope);
+
+    for (int i = 0; i < t.getNumChildren(); ++i)
+    {
+        const auto s = t.getChild (i);
+        const int type = (int) s.getProperty ("type", 0);
+        if (type < 0 || type >= kf::FX_COUNT) continue;
+
+        const int id = addFx (scope, type);
+        if (id < 0) break;
+
+        juce::StringArray vals;
+        vals.addTokens (s.getProperty ("p").toString(), ",", "");
+        const int n = kf::fxInfo (type).n;
+        for (int k = 0; k < n && k < vals.size(); ++k) store.v[(size_t) kf::slotIdx (scope, id, k)].store (kf::clamp01 (vals[k].getFloatValue()));
+        store.v[(size_t) kf::slotIdx (scope, id, kf::kOnK)].store ((float) s.getProperty ("on", 1.0));
+    }
+
+    ++store.version;
+    return true;
+}
+
+void KickForgeAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    if (auto xml = toTree().createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void KickForgeAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    if (auto xml = getXmlFromBinary (data, sizeInBytes))
+    {
+        const auto tree = juce::ValueTree::fromXml (*xml);
+        if (tree.isValid() && tree.hasType ("KF3")) fromTree (tree);
+    }
 }
 
 //==============================================================================
@@ -497,14 +801,18 @@ void KickForgeAudioProcessor::applyShaperPreset (int slot, int preset)
 bool KickForgeAudioProcessor::renderOffline (Engine& e, double sr, double maxSeconds, juce::AudioBuffer<float>& sum,
                                              std::array<juce::AudioBuffer<float>, kNumSlots>* layers)
 {
+    juce::ScopedNoDenormals noDenormals;
+
     e.prepare (sr);
+    if (e.racksStale()) e.syncRacks();
+    e.setBpm (hostBpm.load());
     e.trigger (-1);
 
     const double longest = e.longestSeconds();
     if (longest <= 0.0)
         return false;
 
-    const double secs = std::min (maxSeconds, longest + (e.anyReverbOn() ? 0.8 : 0.05));
+    const double secs = std::min (maxSeconds, longest + e.tailSeconds());
     const int n = juce::jmax (64, (int) (secs * sr));
 
     sum.setSize (2, n);
@@ -513,7 +821,7 @@ bool KickForgeAudioProcessor::renderOffline (Engine& e, double sr, double maxSec
     if (layers != nullptr)
         for (auto& b : *layers) { b.setSize (2, n); b.clear(); }
 
-    e.render (sum, 0, n, layers);
+    e.render (sum, 0, n, layers, hostBpm.load());
     return true;
 }
 
@@ -521,17 +829,13 @@ juce::uint64 KickForgeAudioProcessor::computeHash() const
 {
     juce::uint64 h = 1469598103934665603ull;
     auto mix = [&h] (juce::uint32 v) { h ^= v; h *= 1099511628211ull; };
+    auto mixF = [&mix] (float f) { juce::uint32 bits = 0; std::memcpy (&bits, &f, sizeof (bits)); mix (bits); };
 
-    for (auto* p : allParams)
-    {
-        const float f = p->load();
-        juce::uint32 bits = 0;
-        std::memcpy (&bits, &f, sizeof (bits));
-        mix (bits);
-    }
-
-    mix ((juce::uint32) shaperVersion.load());
+    mix ((juce::uint32) store.version.load());
+    mixF (outP->load());
+    for (auto* m : macroP) mixF (m->load());
     for (const auto& v : sampleVersion) mix ((juce::uint32) v.load());
+    for (const auto& v : rackVer) mix ((juce::uint32) v.load());
     return h;
 }
 
@@ -543,6 +847,7 @@ bool KickForgeAudioProcessor::previewNeedsUpdate() const
 
 void KickForgeAudioProcessor::renderPreview()
 {
+    collectGarbage();
     lastPreviewHash = computeHash();
     lastPreviewMs = juce::Time::getMillisecondCounterHiRes();
 
@@ -570,20 +875,16 @@ void KickForgeAudioProcessor::renderPreview()
         toMono (sum, pv.sum);
 
         bool anySolo = false;
-        std::array<LayerSnap, kNumSlots> snaps;
-        for (int i = 0; i < kNumSlots; ++i)
-        {
-            readLayer (i, snaps[(size_t) i]);
-            anySolo = anySolo || snaps[(size_t) i].solo;
-        }
+        for (int i = 0; i < kNumSlots; ++i) anySolo = anySolo || getReal (kf::layerIdx (i, kf::LP_SOLO)) > 0.5f;
 
         std::vector<float> mix ((size_t) n, 0.0f);
 
         for (int i = 0; i < kNumSlots; ++i)
         {
-            const auto& s = snaps[(size_t) i];
-            pv.present[(size_t) i] = getSample (i) != nullptr;
-            pv.audible[(size_t) i] = pv.present[(size_t) i] && ! s.mute && (! anySolo || s.solo);
+            const bool osc = getReal (kf::layerIdx (i, kf::LP_SRC)) > 0.5f;
+            pv.present[(size_t) i] = osc || getSample (i) != nullptr;
+            pv.audible[(size_t) i] = pv.present[(size_t) i] && getReal (kf::layerIdx (i, kf::LP_MUTE)) < 0.5f
+                                     && (! anySolo || getReal (kf::layerIdx (i, kf::LP_SOLO)) > 0.5f);
             toMono (layers[(size_t) i], pv.layer[(size_t) i]);
 
             if (pv.audible[(size_t) i])
@@ -628,7 +929,7 @@ void KickForgeAudioProcessor::renderPreview()
 bool KickForgeAudioProcessor::exportKick (const juce::File& destination)
 {
     const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
-    auto e = std::make_unique<Engine> (*this);
+    auto e = std::make_unique<Engine> (*this, false);
     juce::AudioBuffer<float> sum;
 
     if (! renderOffline (*e, sr, 4.0, sum, nullptr))
@@ -653,68 +954,9 @@ bool KickForgeAudioProcessor::exportKick (const juce::File& destination)
     if (writer == nullptr)
         return false;
 
-    stream.release(); // the writer owns the stream now
+    stream.release();
     writer->writeFromAudioSampleBuffer (sum, 0, n);
     return true;
-}
-
-//==============================================================================
-void KickForgeAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
-{
-    auto state = apvts.copyState();
-
-    state.setProperty ("folder", mainFolder.getFullPathName(), nullptr);
-
-    for (int i = 0; i < kNumSlots; ++i)
-    {
-        const auto n = juce::String (i);
-
-        const auto s = getSample (i);
-        state.setProperty ("path" + n, s != nullptr ? s->path : juce::String(), nullptr);
-        state.setProperty ("lfolder" + n, layerFolder[(size_t) i].getFullPathName(), nullptr);
-
-        juce::StringArray pts;
-        for (int k = 0; k < kShaperN; ++k)
-            pts.add (juce::String (getShaperPoint (i, k), 3));
-        state.setProperty ("shaper" + n, pts.joinIntoString (","), nullptr);
-    }
-
-    if (auto xml = state.createXml())
-        copyXmlToBinary (*xml, destData);
-}
-
-void KickForgeAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
-{
-    if (auto xml = getXmlFromBinary (data, sizeInBytes))
-    {
-        auto tree = juce::ValueTree::fromXml (*xml);
-
-        if (! tree.isValid() || ! tree.hasType (apvts.state.getType()))
-            return;
-
-        apvts.replaceState (tree);
-        mainFolder = juce::File (tree.getProperty ("folder").toString());
-
-        for (int i = 0; i < kNumSlots; ++i)
-        {
-            const auto n = juce::String (i);
-
-            const auto path = tree.getProperty ("path" + n).toString();
-            if (path.isNotEmpty())
-                loadSample (i, juce::File (path));
-
-            const auto lf = tree.getProperty ("lfolder" + n).toString();
-            layerFolder[(size_t) i] = lf.isNotEmpty() ? juce::File (lf) : juce::File();
-
-            juce::StringArray pts;
-            pts.addTokens (tree.getProperty ("shaper" + n).toString(), ",", "");
-            if (pts.size() == kShaperN)
-                for (int k = 0; k < kShaperN; ++k)
-                    shaper[(size_t) i][(size_t) k].store (juce::jlimit (0.0f, 1.0f, pts[k].getFloatValue()));
-        }
-
-        ++shaperVersion;
-    }
 }
 
 juce::AudioProcessorEditor* KickForgeAudioProcessor::createEditor()
