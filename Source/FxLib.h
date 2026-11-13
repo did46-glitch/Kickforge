@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Dsp2.h"
+#include "Dsp3.h"
 #include "Store.h"
 #include <initializer_list>
 #include <memory>
@@ -9,7 +9,7 @@
 // Effect registry: metadata (names, ranges) + processors, all addressed by generic parameter arrays.
 namespace kf
 {
-struct FxCtx { double sr = 44100.0, bpm = 120.0; };
+struct FxCtx { double sr = 44100.0, bpm = 120.0; std::atomic<float>* meter = nullptr; };
 
 class FxBase
 {
@@ -21,7 +21,7 @@ public:
 };
 
 enum FxType { FX_TRANS, FX_SHIFT, FX_DIST, FX_CLIP, FX_EQ, FX_MB, FX_REVERB, FX_DELAY, FX_FLANGER, FX_PHASER,
-              FX_STEREO, FX_HYPER, FX_PITCH, FX_FILTER, FX_COUNT };
+              FX_STEREO, FX_HYPER, FX_PITCH, FX_FILTER, FX_OTT, FX_CONV, FX_COUNT };
 
 struct FxTypeInfo { const char* name; int n; PInfo p[kOnK]; };
 
@@ -53,8 +53,11 @@ inline const std::array<FxTypeInfo, FX_COUNT>& fxTable()
         def (FX_MB, "Multiband", { PF ("Split 1", 40, 400, 120, F_HZ, 0.5f), PF ("Split 2", 500, 8000, 2500, F_HZ, 0.5f),
                                    PF ("Low thresh", -48, 0, -18, F_DB), PF ("Mid thresh", -48, 0, -18, F_DB), PF ("High thresh", -48, 0, -18, F_DB),
                                    PF ("Ratio", 1, 20, 4, F_RATIO, 0.5f), PF ("Makeup", 0, 12, 0, F_DB) });
-        def (FX_REVERB, "Reverb", { PF ("Size", 0, 1, 0.35f, F_PCT), PF ("Damping", 0, 1, 0.5f, F_PCT), PF ("Width", 0, 1, 1, F_PCT),
-                                    PF ("Pre-delay", 0, 200, 0, F_MS, 0.5f), PF ("Mix", 0, 1, 0.2f, F_PCT) });
+        def (FX_REVERB, "Reverb", { PC ("Algorithm", "Room|Hall|Plate|Chamber|Gated", 1), PF ("Size", 0.3f, 2.0f, 1.0f, F_X),
+                                    PF ("Decay", 100, 12000, 2000, F_MS, 0.4f), PF ("Pre-delay", 0, 250, 0, F_MS, 0.5f),
+                                    PF ("Damping", 1000, 20000, 8000, F_HZ, 0.4f), PF ("Low cut", 20, 1000, 20, F_HZ, 0.4f),
+                                    PF ("Diffusion", 0, 1, 0.7f, F_PCT), PF ("Modulation", 0, 1, 0.3f, F_PCT),
+                                    PF ("Width", 0, 1, 1, F_PCT), PF ("Mix", 0, 1, 0.2f, F_PCT) });
         def (FX_DELAY, "Delay", { PF ("Time L", 1, 2000, 250, F_MS, 0.4f), PF ("Time R", 1, 2000, 250, F_MS, 0.4f), PB ("Tempo sync"),
                                   PC ("Division L", "1/4|1/8|1/16|1/32|1/4T|1/8T|1/16T|1/8.|1/16.|1/2|1 bar", 1),
                                   PC ("Division R", "1/4|1/8|1/16|1/32|1/4T|1/8T|1/16T|1/8.|1/16.|1/2|1 bar", 1),
@@ -72,6 +75,12 @@ inline const std::array<FxTypeInfo, FX_COUNT>& fxTable()
         def (FX_FILTER, "Filter", { PC ("Type", "Lowpass|Highpass|Bandpass|Notch|Peak|Low shelf|High shelf"), PC ("Slope", "12 dB|24 dB"),
                                     PF ("Cutoff", 20, 20000, 1000, F_HZ, 0.3f), PF ("Resonance", 0.3f, 12, 0.7f, F_PLAIN, 0.5f),
                                     PF ("Gain", -18, 18, 0, F_DB), PF ("Mix", 0, 1, 1, F_PCT) });
+        def (FX_OTT, "OTT multiband", { PF ("Depth", 0, 1, 1, F_PCT), PF ("Time", 0, 1, 0.5f, F_PCT), PF ("Upward", 0, 1, 1, F_PCT), PF ("Downward", 0, 1, 1, F_PCT),
+                                        PF ("In", -12, 12, 0, F_DB), PF ("Out", -12, 12, 0, F_DB),
+                                        PF ("Low gain", -12, 12, 0, F_DB), PF ("Mid gain", -12, 12, 0, F_DB), PF ("High gain", -12, 12, 0, F_DB),
+                                        PF ("Split 1", 40, 400, 120, F_HZ, 0.5f), PF ("Split 2", 500, 8000, 2500, F_HZ, 0.5f), PF ("Mix", 0, 1, 1, F_PCT) });
+        def (FX_CONV, "Convolver", { PF ("Mix", 0, 1, 0.5f, F_PCT), PF ("Gain", -24, 12, 0, F_DB), PF ("Pre-delay", 0, 200, 0, F_MS, 0.5f),
+                                     PF ("Low cut", 20, 2000, 20, F_HZ, 0.4f), PF ("High cut", 1000, 20000, 20000, F_HZ, 0.4f) });
         return a;
     }();
     return t;
@@ -221,50 +230,123 @@ public:
 private: MbComp fx;
 };
 
-// juce::Reverb is wet-only here; pre-delay and dry/wet are handled around it
 class FxReverb : public FxBase
 {
 public:
+    void prepare (double s) override { fx.prepare (s); }
+    void reset() override { fx.reset(); }
+    void process (float* l, float* r, int n, const float* p, const FxCtx&) override
+    {
+        ReverbP q;
+        q.algo = clampi ((int) std::lround (p[0]), 0, 4); q.size = p[1]; q.decayMs = p[2]; q.predelayMs = p[3];
+        q.dampHz = p[4]; q.lowHz = p[5]; q.diffusion = p[6]; q.mod = p[7]; q.width = p[8];
+        fx.process (l, r, n, q, p[9]);
+    }
+private: FdnReverb fx;
+};
+
+class FxOtt : public FxBase
+{
+public:
+    void prepare (double s) override { fx.prepare (s); }
+    void reset() override { fx.reset(); }
+    void process (float* l, float* r, int n, const float* p, const FxCtx& c) override
+    {
+        OttParams q;
+        q.depth = p[0]; q.time = p[1]; q.up = p[2]; q.down = p[3]; q.inDb = p[4]; q.outDb = p[5];
+        q.gLow = p[6]; q.gMid = p[7]; q.gHigh = p[8]; q.f1 = p[9]; q.f2 = p[10]; q.mix = p[11];
+        fx.process (l, r, n, q, c.meter);
+    }
+private: OttComp fx;
+};
+
+// Convolution reverb / cabinet / any impulse response. The IR is loaded by the processor.
+class FxConv : public FxBase
+{
+public:
+    void setIR (std::shared_ptr<const IRData> d) { ir = std::move (d); }
+
     void prepare (double s) override
     {
-        pdSize = (int) (0.21 * s) + 8;
-        for (auto& b : pd) b.assign ((size_t) pdSize, 0.0f);
-        tmp[0].assign (4096, 0.0f); tmp[1].assign (4096, 0.0f);
-        rev.prepare (s);
+        sr = s;
+        pd[0].assign ((size_t) (0.21 * s) + 8, 0.0f);
+        pd[1].assign (pd[0].size(), 0.0f);
+        wl.assign (4096, 0.0f); wr.assign (4096, 0.0f);
+        ready = false;
+
+        if (ir != nullptr && ! ir->l.empty())
+        {
+            const double ratio = ir->sr / s;
+            const int outLen = std::max (1, std::min ((int) ((double) ir->l.size() / ratio), (int) (2.5 * s)));
+            std::vector<float> a ((size_t) outLen), b ((size_t) outLen);
+
+            for (int i = 0; i < outLen; ++i)
+            {
+                const double pos = (double) i * ratio;
+                const int i0 = std::min ((int) pos, (int) ir->l.size() - 1), i1 = std::min (i0 + 1, (int) ir->l.size() - 1);
+                const float f = (float) (pos - (double) i0);
+                a[(size_t) i] = ir->l[(size_t) i0] + f * (ir->l[(size_t) i1] - ir->l[(size_t) i0]);
+                b[(size_t) i] = ir->r[(size_t) i0] + f * (ir->r[(size_t) i1] - ir->r[(size_t) i0]);
+            }
+
+            conv.setIR (a.data(), b.data(), outLen);
+            ready = true;
+        }
+
         reset();
     }
 
-    void reset() override { for (auto& b : pd) std::fill (b.begin(), b.end(), 0.0f); pdw = 0; rev.reset(); sr = 0.0; }
-
-    void process (float* l, float* r, int n, const float* p, const FxCtx& c) override
+    void reset() override
     {
-        if (n > (int) tmp[0].size()) { tmp[0].resize ((size_t) n); tmp[1].resize ((size_t) n); }
-        const int dly = (int) (p[3] * 0.001f * (float) c.sr);
+        conv.reset();
+        for (auto& b : pd) std::fill (b.begin(), b.end(), 0.0f);
+        pdw = 0;
+        for (int c = 0; c < 2; ++c) { hp[c].reset(); lp[c].reset(); }
+    }
+
+    void process (float* l, float* r, int n, const float* p, const FxCtx&) override
+    {
+        if (! ready) return;
+        if (n > (int) wl.size()) { wl.resize ((size_t) n); wr.resize ((size_t) n); }
+
+        const int dly = (int) (p[2] * 0.001f * (float) sr), size = (int) pd[0].size();
+        const float gain = dbToGain (p[1]), mix = p[0];
+        const bool useHp = p[3] > 20.5f, useLp = p[4] < 19900.0f;
+
+        for (int c = 0; c < 2; ++c)
+        {
+            if (useHp) hp[c].setHighpass (p[3], 0.7071f, sr);
+            if (useLp) lp[c].setLowpass (p[4], 0.7071f, sr);
+        }
 
         for (int i = 0; i < n; ++i)
         {
             pd[0][(size_t) pdw] = l[i]; pd[1][(size_t) pdw] = r[i];
-            int rp = pdw - dly; if (rp < 0) rp += pdSize;
-            tmp[0][(size_t) i] = pd[0][(size_t) rp]; tmp[1][(size_t) i] = pd[1][(size_t) rp];
-            if (++pdw >= pdSize) pdw = 0;
+            int rp = pdw - dly; if (rp < 0) rp += size;
+            wl[(size_t) i] = pd[0][(size_t) rp]; wr[(size_t) i] = pd[1][(size_t) rp];
+            if (++pdw >= size) pdw = 0;
         }
 
-        ReverbParams q; q.size = p[0]; q.damp = p[1]; q.mix = 1.0f; q.width = p[2];
-        rev.process (tmp[0].data(), tmp[1].data(), n, q);
+        conv.process (wl.data(), wr.data(), n);
 
-        const float mix = p[4];
         for (int i = 0; i < n; ++i)
         {
-            l[i] = l[i] * (1.0f - mix) + tmp[0][(size_t) i] * mix;
-            r[i] = r[i] * (1.0f - mix) + tmp[1][(size_t) i] * mix;
+            float a = wl[(size_t) i] * gain, b = wr[(size_t) i] * gain;
+            if (useHp) { a = hp[0].process (a); b = hp[1].process (b); }
+            if (useLp) { a = lp[0].process (a); b = lp[1].process (b); }
+            l[i] = l[i] * (1.0f - mix) + a * mix;
+            r[i] = r[i] * (1.0f - mix) + b * mix;
         }
     }
 
 private:
-    ReverbFx rev;
-    std::vector<float> pd[2], tmp[2];
-    int pdSize = 0, pdw = 0;
-    double sr = 0.0;
+    std::shared_ptr<const IRData> ir;
+    Convolver conv;
+    std::vector<float> pd[2], wl, wr;
+    Biquad hp[2], lp[2];
+    int pdw = 0;
+    bool ready = false;
+    double sr = 44100.0;
 };
 
 class FxDelay : public FxBase
@@ -375,6 +457,8 @@ inline std::unique_ptr<FxBase> makeFx (int type)
         case FX_STEREO:  return std::make_unique<FxStereo>();
         case FX_HYPER:   return std::make_unique<FxHyper>();
         case FX_PITCH:   return std::make_unique<FxPitch>();
+        case FX_OTT:     return std::make_unique<FxOtt>();
+        case FX_CONV:    return std::make_unique<FxConv>();
         default:         return std::make_unique<FxFilter>();
     }
 }

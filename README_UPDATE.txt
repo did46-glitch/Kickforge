@@ -1,4 +1,4 @@
-KICKFORGE v3.0 - UPDATE AND QUICK GUIDE
+KICKFORGE v3.1 - UPDATE AND QUICK GUIDE
 =======================================
 
 UPDATE (about 20 minutes, browser only)
@@ -20,6 +20,7 @@ UPDATE (about 20 minutes, browser only)
 If the build turns red: download the "build-log" artifact (or copy the red
 error text from the failed "Build" step) and send it to Claude.
 Old v1/v2 projects and presets do not load in v3 (new parameter system).
+Patches saved with v3.0 load, but their Reverb knobs need setting again (new reverb).
 
 QUICK GUIDE
 -----------
@@ -49,3 +50,20 @@ Effects     Bottom rack (per layer, click "Master" for the master rack).
 Knobs       Hold SHIFT while dragging for fine control. Double-click resets.
             Type values: C4, F#2, 1.5k, 20 ms, 50 %.
             Note names: C3 = middle C = MIDI 60.
+
+NEW IN 3.1
+----------
+Reverb      5 algorithms: Room, Hall, Plate, Chamber, Gated (gate time = Decay).
+            Decay up to 12 s, pre-delay, damping, low cut, diffusion, modulation, width.
+OTT         "OTT multiband" effect: Depth, Time, Upward, Downward, In/Out, gain per
+            band. Drag the two crossover lines in the display. The bars show how much
+            each band is being turned down (below the line) or up (above the line).
+Convolver   "Convolver" effect: "Load impulse response..." (wav / aiff / flac, up to
+            3 s). Zero latency. Use it for rooms, plates, cabinets or short tonal
+            bodies. The file path is saved in the patch, keep the file where it is.
+Time stretch  Layer tab > Pitch mode:
+              Resample    classic, higher pitch = shorter sound
+              Stretch     WSOLA time stretch + resampling: the pitch changes but the
+              (WSOLA)     LENGTH stays. The "Stretch" knob then changes the length
+                          on its own (0.25x to 4x) without changing the pitch.
+              Granular    live pitch shifter, keeps the length too, a different sound

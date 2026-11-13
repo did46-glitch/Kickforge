@@ -320,6 +320,7 @@ void KickForgeAudioProcessor::removeFx (int scope, int slotId)
     c.erase (std::remove_if (c.begin(), c.end(), [slotId] (const SlotCfg& s) { return s.id == slotId; }), c.end());
 
     clearRoutesInRange (store, kf::slotIdx (scope, slotId, 0), kf::slotIdx (scope, slotId, kf::kSlotStride - 1));
+    irs[(size_t) scope][(size_t) slotId].reset();
     store.slotType[scope][slotId].store (-1);
     for (int k = 0; k < kf::kSlotStride; ++k) store.v[(size_t) kf::slotIdx (scope, slotId, k)].store (0.0f);
 
@@ -348,6 +349,7 @@ void KickForgeAudioProcessor::changeFxType (int scope, int slotId, int type)
         if (s.id == slotId)
         {
             s.type = type;
+            irs[(size_t) scope][(size_t) slotId].reset();
             clearRoutesInRange (store, kf::slotIdx (scope, slotId, 0), kf::slotIdx (scope, slotId, kf::kSlotStride - 1));
             kf::applySlotDefaults (store, scope, slotId, type);
         }
@@ -380,6 +382,7 @@ void KickForgeAudioProcessor::clearRack (int scope)
     for (const auto& s : std::vector<SlotCfg> (cfg[(size_t) scope]))
     {
         clearRoutesInRange (store, kf::slotIdx (scope, s.id, 0), kf::slotIdx (scope, s.id, kf::kSlotStride - 1));
+        irs[(size_t) scope][(size_t) s.id].reset();
         store.slotType[scope][s.id].store (-1);
         for (int k = 0; k < kf::kSlotStride; ++k) store.v[(size_t) kf::slotIdx (scope, s.id, k)].store (0.0f);
     }
@@ -400,6 +403,8 @@ std::shared_ptr<RackRt> KickForgeAudioProcessor::buildRack (int scope, double sr
         it.slotId = c.id;
         it.type = c.type;
         it.fx = kf::makeFx (c.type);
+        if (c.type == kf::FX_CONV)
+            if (auto* cv = dynamic_cast<kf::FxConv*> (it.fx.get())) cv->setIR (irs[(size_t) scope][(size_t) c.id]);
         it.fx->prepare (sr);
         for (float& x : it.cacheN) x = -1.0f;
         for (float& x : it.real) x = 0.0f;
@@ -432,6 +437,40 @@ bool KickForgeAudioProcessor::fetchLiveRack (int scope, std::shared_ptr<RackRt>&
     dst = liveRack[(size_t) scope];
     ver = rackVer[(size_t) scope].load();
     return true;
+}
+
+bool KickForgeAudioProcessor::loadIR (int scope, int slotId, const juce::File& file)
+{
+    std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
+    if (reader == nullptr || reader->lengthInSamples <= 0) return false;
+
+    const int len = (int) std::min<juce::int64> (reader->lengthInSamples, (juce::int64) (reader->sampleRate * 3.0));
+    juce::AudioBuffer<float> buf (2, len);
+    buf.clear();
+    reader->read (&buf, 0, len, 0, true, reader->numChannels > 1);
+    if (reader->numChannels == 1) buf.copyFrom (1, 0, buf, 0, 0, len);
+
+    auto ir = std::make_shared<kf::IRData>();
+    ir->sr = reader->sampleRate;
+    ir->l.assign (buf.getReadPointer (0), buf.getReadPointer (0) + len);
+    ir->r.assign (buf.getReadPointer (1), buf.getReadPointer (1) + len);
+    ir->name = file.getFullPathName().toStdString();
+
+    {
+        const juce::ScopedLock sl (cfgLock);
+        irs[(size_t) scope][(size_t) slotId] = ir;
+    }
+
+    ++store.version;
+    rebuildLive (scope);
+    return true;
+}
+
+juce::String KickForgeAudioProcessor::getIRName (int scope, int slotId) const
+{
+    const juce::ScopedLock sl (cfgLock);
+    const auto& ir = irs[(size_t) scope][(size_t) slotId];
+    return ir != nullptr ? juce::File (juce::String (ir->name)).getFileName() : juce::String();
 }
 
 void KickForgeAudioProcessor::collectGarbage()
@@ -591,6 +630,15 @@ juce::ValueTree KickForgeAudioProcessor::toTree()
     }
     t.setProperty ("racks", rs, nullptr);
 
+    juce::String irString;
+    {
+        const juce::ScopedLock sl (cfgLock);
+        for (int s = 0; s < kNumScopes; ++s)
+            for (int id = 0; id < kf::kMaxSlots; ++id)
+                if (irs[(size_t) s][(size_t) id] != nullptr) irString << s << "." << id << "=" << juce::String (irs[(size_t) s][(size_t) id]->name) << ";";
+    }
+    t.setProperty ("irs", irString, nullptr);
+
     juce::String routes;
     for (const auto& r : store.routes)
         if (r.src.load() >= 0 && r.target.load() >= 0)
@@ -643,6 +691,20 @@ void KickForgeAudioProcessor::fromTree (const juce::ValueTree& t)
     }
 
     for (int s = 0; s < kNumScopes; ++s) rebuildLive (s);
+
+    {
+        juce::StringArray toks;
+        toks.addTokens (t.getProperty ("irs").toString(), ";", "");
+
+        for (const auto& tk : toks)
+        {
+            const int eq = tk.indexOfChar ('=');
+            if (eq < 3) continue;
+            juce::StringArray f;
+            f.addTokens (tk.substring (0, eq), ".", "");
+            if (f.size() == 2) loadIR (f[0].getIntValue(), f[1].getIntValue(), juce::File (tk.substring (eq + 1)));
+        }
+    }
 
     {
         juce::StringArray toks;
@@ -742,6 +804,11 @@ bool KickForgeAudioProcessor::saveFxChain (int scope, const juce::String& name)
         s.setProperty ("type", sv.type, nullptr);
         s.setProperty ("on", getN (kf::slotIdx (scope, sv.id, kf::kOnK)), nullptr);
         s.setProperty ("p", vals, nullptr);
+        {
+            const juce::ScopedLock sl (cfgLock);
+            const auto& ir = irs[(size_t) scope][(size_t) sv.id];
+            if (ir != nullptr) s.setProperty ("ir", juce::String (ir->name), nullptr);
+        }
         t.addChild (s, -1, nullptr);
     }
 
@@ -775,6 +842,8 @@ bool KickForgeAudioProcessor::loadFxChain (int scope, const juce::File& file)
         const int n = kf::fxInfo (type).n;
         for (int k = 0; k < n && k < vals.size(); ++k) store.v[(size_t) kf::slotIdx (scope, id, k)].store (kf::clamp01 (vals[k].getFloatValue()));
         store.v[(size_t) kf::slotIdx (scope, id, kf::kOnK)].store ((float) s.getProperty ("on", 1.0));
+        const auto irPath = s.getProperty ("ir").toString();
+        if (type == kf::FX_CONV && irPath.isNotEmpty()) loadIR (scope, id, juce::File (irPath));
     }
 
     ++store.version;

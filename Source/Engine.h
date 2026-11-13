@@ -31,7 +31,7 @@ public:
         outSm.snap (kf::dbToGain (owner.readOutDb()));
 
         if (live)
-            for (int l = 0; l < kf::kLayers; ++l) ensurePitch (l);
+            for (int l = 0; l < kf::kLayers; ++l) { ensurePitch (l); ensureWsola (l); }
 
         if (live) rackVer.fill (-1);
         reset();
@@ -138,7 +138,18 @@ public:
                 v.fadeIn = v.s0 > 0.5 ? (int) (0.0007 * sr) : 0;
                 v.active = true;
                 v.rate = playRate (l);
-                if (! live && PL (l, kf::LP_MODE) > 0.5f) ensurePitch (l);
+                const int mode = (int) std::lround (PL (l, kf::LP_MODE));
+                if (mode == 1)
+                {
+                    v.ws = true;
+                    v.userStretch = (double) PL (l, kf::LP_STRETCH);
+                    if (! live) ensureWsola (l);
+                    const auto& a = v.sample->audio;
+                    wsola[(size_t) l].start (a.getReadPointer (0), a.getReadPointer (a.getNumChannels() > 1 ? 1 : 0), len, v.s0, v.s1);
+                    v.spos = 0.0;
+                    v.wsDur = (v.s1 - v.s0) / srcSr * v.userStretch;
+                }
+                if (! live && mode == 2) ensurePitch (l);
             }
 
             layerIdle[(size_t) l] = false;
@@ -203,7 +214,7 @@ public:
                     {
                         generateSample (l, n);
 
-                        if (PL (l, kf::LP_MODE) > 0.5f && pitchReady[(size_t) l])
+                        if ((int) std::lround (PL (l, kf::LP_MODE)) == 2 && pitchReady[(size_t) l])
                         {
                             kf::PitchParams pp;
                             pp.semis = totalSemis (l);
@@ -304,6 +315,7 @@ public:
             if (! v.active) continue;
             double secs = (double) v.pre / sr;
             if (v.osc) secs += (double) v.oscLeft / sr;
+            else if (v.ws) secs += v.wsDur + (double) v.tail / sr;
             else if (v.rate > 0.0) secs += ((v.s1 - v.pos) / v.rate + (double) v.tail) / sr;
             longest = std::max (longest, secs);
         }
@@ -335,6 +347,7 @@ public:
         const auto& v = voices[(size_t) i];
         if (! v.active) return -1.0f;
         if (v.osc) return 0.0f;
+        if (v.ws) return (float) ((v.s0 + v.spos / std::max (0.25, v.sEff)) / std::max (1.0, v.lenFull));
         return (float) (v.pos / std::max (1.0, v.lenFull));
     }
 
@@ -343,8 +356,9 @@ private:
     {
         std::shared_ptr<KickSample> sample;
         double pos = 0.0, rate = 1.0, s0 = 0.0, s1 = 0.0, phase = 0.0, fcur = 0.0, lenFull = 1.0;
+        double spos = 0.0, userStretch = 1.0, sEff = 1.0, wsDur = 0.0;
         int pre = 0, tail = 0, oscLeft = 0, age = 0, fadeIn = 0;
-        bool active = false, osc = false, ended = false;
+        bool active = false, osc = false, ended = false, ws = false;
     };
 
     int scopeOf (const RackRt* r) const
@@ -382,7 +396,7 @@ private:
     {
         const auto& v = voices[(size_t) l];
         const double base = v.sample != nullptr ? v.sample->sampleRate / sr : 1.0;
-        return PL (l, kf::LP_MODE) > 0.5f ? base : base * std::pow (2.0, (double) totalSemis (l) / 12.0);
+        return (int) std::lround (PL (l, kf::LP_MODE)) == 2 ? base : base * std::pow (2.0, (double) totalSemis (l) / 12.0);
     }
 
     double oscFreq (int l) const
@@ -394,6 +408,11 @@ private:
     void ensurePitch (int l)
     {
         if (! pitchReady[(size_t) l]) { pitch[(size_t) l].prepare (sr); pitchReady[(size_t) l] = true; }
+    }
+
+    void ensureWsola (int l)
+    {
+        if (! wsolaReady[(size_t) l]) { wsola[(size_t) l].prepare(); wsolaReady[(size_t) l] = true; }
     }
 
     float evalMod (int m, double t, double bpm, double dt)
@@ -494,13 +513,55 @@ private:
                 if (nrm != it.cacheN[k]) { it.cacheN[k] = nrm; it.real[k] = kf::toReal (ti.p[k], nrm); }
             }
 
+            ctx.meter = live ? &owner.store.fxMeter[scope][it.slotId][0] : nullptr;
             it.fx->process (l, r, n, it.real, ctx);
+        }
+    }
+
+    void generateWsola (int l, int n)
+    {
+        auto& v = voices[(size_t) l];
+        auto& ws = wsola[(size_t) l];
+        const double dr = (playRate (l) - v.rate) / (double) n;
+        v.sEff = std::pow (2.0, (double) totalSemis (l) / 12.0) * v.userStretch;
+        ws.setStretch ((float) v.sEff);
+        const double fadeOut = std::max (1.0, 0.0015 * v.sample->sampleRate);
+
+        for (int k = 0; k < n; ++k)
+        {
+            if (v.pre > 0) { --v.pre; continue; }
+
+            if (v.ended)
+            {
+                if (v.tail > 0) --v.tail; else { v.active = false; break; }
+                continue;
+            }
+
+            v.rate += dr;
+            const long long i0 = (long long) v.spos;
+            ws.ensureUntil (i0 + 2);
+            if (! ws.valid (i0 + 1)) { v.ended = true; continue; }
+
+            float a, b, c, d;
+            ws.read (i0, a, b);
+            ws.read (i0 + 1, c, d);
+            const float fr = (float) (v.spos - (double) i0);
+
+            float f = 1.0f;
+            if (v.fadeIn > 0 && v.age < v.fadeIn) f = (float) v.age / (float) v.fadeIn;
+            if (ws.endAt() >= 0) f *= (float) std::max (0.0, std::min (1.0, ((double) ws.endAt() - v.spos) / fadeOut));
+            ++v.age;
+
+            tmpL[k] += (a + fr * (c - a)) * f;
+            tmpR[k] += (b + fr * (d - b)) * f;
+            v.spos += v.rate;
         }
     }
 
     void generateSample (int l, int n)
     {
         auto& v = voices[(size_t) l];
+        if (v.ws) { generateWsola (l, n); return; }
         const auto& a = v.sample->audio;
         const int len = a.getNumSamples();
         const float* L = a.getReadPointer (0);
@@ -578,6 +639,8 @@ private:
     kf::Smoother outSm;
     std::array<kf::PitchShiftFx, kf::kLayers> pitch;
     std::array<bool, kf::kLayers> pitchReady {};
+    std::array<kf::Wsola, kf::kLayers> wsola;
+    std::array<bool, kf::kLayers> wsolaReady {};
     std::array<std::array<std::array<kf::Biquad, 2>, 2>, kf::kLayers> hpf;
 
     std::vector<unsigned char> modTouched;

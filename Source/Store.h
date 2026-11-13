@@ -16,7 +16,7 @@ constexpr int kLayers = 6, kScopes = 7, kMaxSlots = 16, kSlotStride = 32, kOnK =
 constexpr int kMods = 12, kMacros = 4, kSources = kMods + kMacros, kShapeN = 256, kMaxRoutes = 64;
 constexpr int kLayerStride = 24, kModStride = 12;
 
-enum Fmt { F_PLAIN, F_HZ, F_DB, F_PCT, F_MS, F_RATIO, F_SEMI, F_NOTE, F_CHOICE, F_BOOL, F_INT };
+enum Fmt { F_PLAIN, F_HZ, F_DB, F_PCT, F_MS, F_RATIO, F_SEMI, F_NOTE, F_CHOICE, F_BOOL, F_INT, F_X };
 
 struct PInfo { const char* name; float mn, mx, def, skew; int fmt; const char* choices; };
 
@@ -47,7 +47,7 @@ inline float toReal (const PInfo& p, float n)
 
 //==============================================================================
 enum LP { LP_LEVEL, LP_AMP, LP_PITCH, LP_MUTE, LP_SOLO, LP_LOCK, LP_KEY, LP_ROOT, LP_INV, LP_PRE, LP_START,
-          LP_END, LP_TAIL, LP_HPF, LP_SRC, LP_WAVE, LP_MODE, LP_PAN, LP_LEN, LP_COUNT };
+          LP_END, LP_TAIL, LP_HPF, LP_SRC, LP_WAVE, LP_MODE, LP_PAN, LP_LEN, LP_STRETCH, LP_COUNT };
 
 inline const PInfo kLayerInfo[LP_COUNT] =
 {
@@ -59,8 +59,9 @@ inline const PInfo kLayerInfo[LP_COUNT] =
     PF ("Low cut", 20.0f, 500.0f, 20.0f, F_HZ, 0.4f),
     PC ("Source", "Sample|Oscillator"),
     PC ("Wave", "Sine|Wide sine|Triangle|Saw|Square|Soft square|Parabola"),
-    PC ("Pitch mode", "Resample|Keep length"),
+    PC ("Pitch mode", "Resample|Stretch (WSOLA)|Granular"),
     PF ("Pan", -1.0f, 1.0f, 0.0f, F_PCT),            PF ("Length", 20.0f, 4000.0f, 500.0f, F_MS, 0.4f),
+    PF ("Stretch", 0.25f, 4.0f, 1.0f, F_X, 0.5f),
 };
 
 enum MP { MP_TYPE, MP_TIME, MP_RATE, MP_SYNC, MP_DIV, MP_DELAY, MP_SMOOTH, MP_BIP, MP_COUNT };
@@ -112,9 +113,11 @@ struct Store
     std::atomic<float> shapes[kMods][kShapeN];
     Route routes[kMaxRoutes];
     std::atomic<int> version { 0 };
+    std::atomic<float> fxMeter[kScopes][kMaxSlots][4];
 
     Store()
     {
+        for (auto& a : fxMeter) for (auto& b : a) for (auto& c : b) c.store (0.0f);
         for (auto& a : v) a.store (0.0f);
         for (auto& r : slotType) for (auto& a : r) a.store (-1);
         for (int m = 0; m < kMods; ++m) setShapePreset (m, 4);

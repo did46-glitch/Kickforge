@@ -5,7 +5,7 @@ if(APPLE)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 endif()
 
-project(KickForge VERSION 0.3.0)
+project(KickForge VERSION 0.3.1)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +48,7 @@ target_sources(KickForge PRIVATE
     Source/Store.h
     Source/Dsp.h
     Source/Dsp2.h
+    Source/Dsp3.h
     Source/FxLib.h
     Source/UiKit.h
     Source/Bind.h

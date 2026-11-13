@@ -45,6 +45,7 @@ inline juce::String fmtValue (const kf::PInfo& p, float v)
         case kf::F_RATIO:  return String (v, 1) + " : 1";
         case kf::F_SEMI:   return (v > 0.005f ? "+" : "") + String (v, 2) + " st";
         case kf::F_INT:    return String (juce::roundToInt (v));
+        case kf::F_X:      return String (v, 2) + "x";
         case kf::F_BOOL:   return v > 0.5f ? "On" : "Off";
         case kf::F_NOTE:
         {

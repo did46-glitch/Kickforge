@@ -280,6 +280,7 @@ private:
             knob (kf::LP_TAIL, "Silence after");
             knob (kf::LP_HPF, "Low cut");
             knob (kf::LP_PAN, "Pan");
+            knob (kf::LP_STRETCH, "Stretch");
             add (std::make_unique<LabeledBox> ("Pitch mode", std::make_unique<PCombo> (proc, L (kf::LP_MODE))), 130, 44);
         }
         else

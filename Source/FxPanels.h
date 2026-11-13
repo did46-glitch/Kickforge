@@ -308,6 +308,132 @@ private:
 };
 
 //==============================================================================
+// OTT: three bands, level meters show what the compressor does, crossovers are draggable
+class OttDisplay : public juce::Component
+{
+public:
+    OttDisplay (KickForgeAudioProcessor& p, int s, int sl) : proc (p), scope (s), slot (sl) {}
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto b = getLocalBounds().toFloat();
+        g.setColour (panel.darker (0.2f));
+        g.fillRoundedRectangle (b, 6.0f);
+        area = b.reduced (6.0f, 8.0f);
+
+        const float x1 = xOf (getP (9)), x2 = xOf (std::max (getP (10), getP (9) * 1.5f));
+        const float edges[4] = { area.getX(), x1, x2, area.getRight() };
+        static const juce::uint32 cols[3] = { 0xffff7a1a, 0xffffc857, 0xff35e0ff };
+        static const char* names[3] = { "Low", "Mid", "High" };
+
+        const float mid = area.getCentreY(), half = area.getHeight() * 0.5f - 6.0f;
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
+        g.drawHorizontalLine ((int) mid, area.getX(), area.getRight());
+
+        for (int bd = 0; bd < 3; ++bd)
+        {
+            const juce::Colour col (cols[bd]);
+            const float db = juce::jlimit (-24.0f, 24.0f, proc.store.fxMeter[scope][slot][bd].load());
+            const float h = std::fabs (db) / 24.0f * half;
+            const float bx = edges[bd] + 3.0f, bw = std::max (4.0f, edges[bd + 1] - edges[bd] - 6.0f);
+
+            g.setColour (col.withAlpha (0.14f));
+            g.fillRoundedRectangle (bx, area.getY(), bw, area.getHeight(), 4.0f);
+            g.setColour (col.withAlpha (0.9f));
+            if (db >= 0.0f) g.fillRoundedRectangle (bx, mid - h, bw, std::max (2.0f, h), 3.0f);
+            else g.fillRoundedRectangle (bx, mid, bw, std::max (2.0f, h), 3.0f);
+
+            g.setColour (textHi);
+            g.setFont (juce::Font (11.0f, juce::Font::bold));
+            g.drawText (juce::String (names[bd]) + "  " + juce::String (db, 1) + " dB", (int) bx + 4, (int) area.getY() + 2, (int) bw, 14, juce::Justification::centredLeft);
+        }
+
+        for (float x : { x1, x2 })
+        {
+            g.setColour (textHi.withAlpha (0.8f));
+            g.drawLine (x, area.getY(), x, area.getBottom(), 1.5f);
+            g.fillEllipse (x - 4.0f, mid - 4.0f, 8.0f, 8.0f);
+        }
+
+        g.setColour (textLo);
+        g.setFont (10.0f);
+        g.drawText (fmtValue (kf::kLayerInfo[kf::LP_HPF], getP (9)), (int) x1 - 30, (int) area.getBottom() - 12, 60, 11, juce::Justification::centred);
+        g.drawText (fmtValue (kf::kLayerInfo[kf::LP_HPF], getP (10)), (int) x2 - 30, (int) area.getBottom() - 12, 60, 11, juce::Justification::centred);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const float x1 = xOf (getP (9)), x2 = xOf (getP (10));
+        drag = std::fabs (e.position.x - x1) < 12.0f ? 0 : (std::fabs (e.position.x - x2) < 12.0f ? 1 : -1);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (drag < 0 || area.getWidth() < 4.0f) return;
+        const float f = 20.0f * std::pow (1000.0f, (e.position.x - area.getX()) / area.getWidth());
+        proc.setReal (kf::slotIdx (scope, slot, drag == 0 ? 9 : 10), juce::jlimit (drag == 0 ? 40.0f : 500.0f, drag == 0 ? 400.0f : 8000.0f, f));
+        repaint();
+    }
+
+    void mouseUp (const juce::MouseEvent&) override { drag = -1; }
+
+private:
+    float getP (int k) const { return proc.getReal (kf::slotIdx (scope, slot, k)); }
+    float xOf (float f) const { return area.getX() + std::log10 (std::max (20.0f, f) / 20.0f) / 3.0f * area.getWidth(); }
+
+    KickForgeAudioProcessor& proc;
+    int scope, slot, drag = -1;
+    juce::Rectangle<float> area;
+};
+
+class IrLoader : public juce::Component
+{
+public:
+    IrLoader (KickForgeAudioProcessor& p, int s, int sl, juce::Colour accent) : proc (p), scope (s), slot (sl)
+    {
+        btn.setButtonText ("Load impulse response...");
+        btn.setColour (juce::TextButton::buttonOnColourId, accent);
+        btn.onClick = [this]
+        {
+            chooser = std::make_shared<juce::FileChooser> ("Choose an impulse response (wav, aiff, flac - up to 3 s)", proc.getMainFolder(), "*.wav;*.aif;*.aiff;*.flac");
+            juce::Component::SafePointer<IrLoader> safe (this);
+            chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                  [safe, c = chooser] (const juce::FileChooser& fc)
+                                  {
+                                      const auto f = fc.getResult();
+                                      if (safe != nullptr && f.existsAsFile()) { safe->proc.loadIR (safe->scope, safe->slot, f); safe->refresh(); }
+                                  });
+        };
+        addAndMakeVisible (btn);
+
+        name.setFont (juce::Font (11.0f, juce::Font::plain));
+        name.setColour (juce::Label::textColourId, textLo);
+        addAndMakeVisible (name);
+        refresh();
+    }
+
+    void refresh()
+    {
+        const auto n = proc.getIRName (scope, slot);
+        name.setText (n.isEmpty() ? juce::String ("No impulse response loaded") : n, juce::dontSendNotification);
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds();
+        btn.setBounds (r.removeFromTop (26));
+        name.setBounds (r);
+    }
+
+private:
+    KickForgeAudioProcessor& proc;
+    int scope, slot;
+    juce::TextButton btn;
+    juce::Label name;
+    std::shared_ptr<juce::FileChooser> chooser;
+};
+
+//==============================================================================
 class FxPanel : public juce::Component, public Tickable
 {
 public:
@@ -326,6 +452,10 @@ public:
 
         if (type == kf::FX_DIST)
             add (std::make_unique<DistCurve> (proc, scope, slotId, accent), 140, 100);
+        if (type == kf::FX_OTT)
+            add (std::make_unique<OttDisplay> (proc, scope, slotId), 300, 100);
+        if (type == kf::FX_CONV)
+            add (std::make_unique<IrLoader> (proc, scope, slotId, accent), 250, 44);
 
         for (int k = 0; k < ti.n; ++k)
         {
@@ -341,7 +471,7 @@ public:
         }
     }
 
-    void tick() override { for (auto& it : items) if (dynamic_cast<DistCurve*> (it.c.get()) != nullptr) it.c->repaint(); }
+    void tick() override { for (auto& it : items) if (dynamic_cast<DistCurve*> (it.c.get()) != nullptr || dynamic_cast<OttDisplay*> (it.c.get()) != nullptr) it.c->repaint(); }
 
     void resized() override
     {

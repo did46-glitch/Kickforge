@@ -121,6 +121,8 @@ public:
     bool fetchLiveRack (int scope, std::shared_ptr<RackRt>& dst, int& ver) const;
     std::shared_ptr<RackRt> buildRack (int scope, double sr) const;
     void collectGarbage();
+    bool loadIR (int scope, int slotId, const juce::File& file);
+    juce::String getIRName (int scope, int slotId) const;
 
     //== modulation
     int addRoute (int src, int target, int mode, float amount);
@@ -177,6 +179,7 @@ private:
     std::array<std::shared_ptr<RackRt>, kNumScopes> liveRack;
     mutable juce::SpinLock liveLock;
     std::array<std::atomic<int>, kNumScopes> rackVer;
+    std::array<std::array<std::shared_ptr<const kf::IRData>, kf::kMaxSlots>, kNumScopes> irs;
     std::vector<std::shared_ptr<RackRt>> graveyard;
     double graveyardTime = 0.0;
 
